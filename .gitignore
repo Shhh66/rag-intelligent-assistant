@@ -1,2 +1,22 @@
 /.claude
 /.vscode
+
+# Python 虚拟环境
+venv/
+
+# 向量数据库（运行时生成）
+chroma_db/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 运行日志
+qa_log.jsonl
+
+# 用户上传的文档
+uploaded_docs/
+
+# 非代码附件（JD、简历等）
+*.docx
+*.pdf

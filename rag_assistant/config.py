@@ -1,8 +1,11 @@
 import os
+from dotenv import load_dotenv
+
+load_dotenv()  # 从 .env 文件加载环境变量
 
 # ===== DeepSeek API 配置 =====
-# 填入你的 DeepSeek API Key（从 https://platform.deepseek.com/api_keys 获取）
-DEEPSEEK_API_KEY = "已删除-请在.env中配置"
+# API Key 存放在 .env 文件中，不提交到 Git
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
 # LLM 模型名称

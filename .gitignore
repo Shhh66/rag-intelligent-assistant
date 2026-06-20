@@ -21,3 +21,6 @@ uploaded_docs/
 *.docx
 *.pdf
 项目简介.md
+
+# 密钥文件
+.env

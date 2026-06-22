@@ -8,9 +8,9 @@ from vector_store import search
 
 def _translate_query_for_search(query: str) -> str:
     """将中文查询翻译为英文关键词，提升英文文档检索命中率"""
-    client = OpenAI(api_key=GROQ_API_KEY, base_url=GROQ_BASE_URL)
+    client = OpenAI(api_key=GROQ_API_KEY, base_url=GROQ_BASE_URL, timeout=30.0)
     resp = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
+        model=LLM_MODEL,
         messages=[{
             "role": "user",
             "content": f"将以下中文问题翻译为适合英文文档检索的英文关键词（5-10个词即可）：\n\n{query}\n\n只输出英文关键词，不要解释。"
@@ -78,12 +78,12 @@ def answer_with_fallback(query: str, top_k: int = TOP_K) -> str:
     # 2. 无知识库或检索失败 → LLM 直接回答
     if db_error or (not docs_cn and not docs_en):
         print(f"   ⚠️ 知识库不可用，LLM 直接回答", file=sys.stderr)
-        client = OpenAI(api_key=GROQ_API_KEY, base_url=GROQ_BASE_URL)
+        client = OpenAI(api_key=GROQ_API_KEY, base_url=GROQ_BASE_URL, timeout=30.0)
         response = client.chat.completions.create(
             model=LLM_MODEL,
             messages=[{"role": "user", "content": query}],
             temperature=0.7,
-            max_tokens=500,
+            max_tokens=2000,
         )
         answer = response.choices[0].message.content
         return answer + "\n\n> ⚠️ 本回答并非基于上传的知识库文档，由大模型直接生成。"
@@ -101,12 +101,12 @@ def answer_with_fallback(query: str, top_k: int = TOP_K) -> str:
     # 2. 构建 Prompt 并调用 LLM
     prompt = build_prompt(query, merged)
 
-    client = OpenAI(api_key=GROQ_API_KEY, base_url=GROQ_BASE_URL)
+    client = OpenAI(api_key=GROQ_API_KEY, base_url=GROQ_BASE_URL, timeout=30.0)
     response = client.chat.completions.create(
         model=LLM_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.3,
-        max_tokens=500,
+        max_tokens=2000,
     )
 
     answer = response.choices[0].message.content

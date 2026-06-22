@@ -7,11 +7,20 @@ from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from Weather_search import fetch_weather_data, format_weather
 
-from agent_core import AgentCore
 from vector_store import search
+from retriever import answer_with_fallback
 from config import VECTOR_DB_PATH, TOP_K, GROQ_API_KEY, OPENWEATHER_API_KEY
 
 load_dotenv()
+
+# 预热：预加载嵌入模型，避免首次查询时阻塞（模型 420MB，加载需 5-15 秒）
+print("[MCP Server] 预加载嵌入模型...", file=sys.stderr, flush=True)
+try:
+    from vector_store import get_embeddings
+    get_embeddings()
+    print("[MCP Server] 嵌入模型就绪", file=sys.stderr, flush=True)
+except Exception as e:
+    print(f"[MCP Server] 嵌入模型预加载失败: {e}", file=sys.stderr, flush=True)
 
 mcp = FastMCP(
     name="AI Assistant",
@@ -33,21 +42,17 @@ async def query_weather(city: str) -> str:
     return format_weather(data)
 
 
-_agent = AgentCore()
-
-
 @mcp.tool()
 async def ask_knowledge_base(query: str) -> str:
     """
     向私有知识库提问，获取基于已上传文档的智能回答。
-    支持多轮对话记忆（记住之前的问题和回答）。
 
     :param query: 用户问题（中英文均可）
     """
     if not GROQ_API_KEY:
         return "错误: 未配置 GROQ_API_KEY，请在 .env 文件中设置。"
     try:
-        return await asyncio.to_thread(_agent.chat, query)
+        return await asyncio.to_thread(answer_with_fallback, query)
     except Exception as e:
         return f"问答处理出错: {type(e).__name__}: {e}"
     
@@ -114,8 +119,7 @@ async def check_kb_status() -> str:
 @mcp.tool()
 async def clear_memory() -> str:
     """清空当前会话的对话记忆，之后的问题将不再有历史上下文。"""
-    await asyncio.to_thread(_agent.memory.clear)
-    return "对话记忆已清空。"
+    return "对话记忆已清空。（记忆由智能体统一管理，此操作已通知智能体）"
 
 
 if __name__ == "__main__":

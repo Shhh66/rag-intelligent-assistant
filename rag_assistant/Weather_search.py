@@ -3,28 +3,73 @@ import sys
 import httpx
 from typing import Any
 from openai import OpenAI
-from config import OPENWEATHER_API_KEY, GROQ_API_KEY
+from config import OPENWEATHER_API_KEY, GROQ_API_KEY, GROQ_BASE_URL, LLM_MODEL
 
 OPENWEATHER_BASE_URL = "https://api.openweathermap.org/data/2.5/weather"
 USER_AGENT = "weather-app/1.0"
 
 
+# 常见城市中英对照表（LLM 翻译失败时的兜底）
+_CITY_MAP = {
+    "北京": "Beijing", "上海": "Shanghai", "深圳": "Shenzhen",
+    "广州": "Guangzhou", "杭州": "Hangzhou", "成都": "Chengdu",
+    "武汉": "Wuhan", "南京": "Nanjing", "重庆": "Chongqing",
+    "西安": "Xi'an", "天津": "Tianjin", "苏州": "Suzhou",
+    "长沙": "Changsha", "郑州": "Zhengzhou", "东莞": "Dongguan",
+    "青岛": "Qingdao", "沈阳": "Shenyang", "宁波": "Ningbo",
+    "昆明": "Kunming", "大连": "Dalian", "厦门": "Xiamen",
+    "合肥": "Hefei", "佛山": "Foshan", "福州": "Fuzhou",
+    "哈尔滨": "Harbin", "济南": "Jinan", "温州": "Wenzhou",
+    "长春": "Changchun", "石家庄": "Shijiazhuang", "常州": "Changzhou",
+    "泉州": "Quanzhou", "南宁": "Nanning", "贵阳": "Guiyang",
+    "南昌": "Nanchang", "太原": "Taiyuan", "烟台": "Yantai",
+    "嘉兴": "Jiaxing", "南通": "Nantong", "金华": "Jinhua",
+    "珠海": "Zhuhai", "惠州": "Huizhou", "徐州": "Xuzhou",
+    "海口": "Haikou", "乌鲁木齐": "Urumqi", "兰州": "Lanzhou",
+    "呼和浩特": "Hohhot", "银川": "Yinchuan", "西宁": "Xining",
+    "拉萨": "Lhasa", "台北": "Taipei", "香港": "Hong Kong",
+    "澳门": "Macau", "东京": "Tokyo", "首尔": "Seoul",
+    "曼谷": "Bangkok", "新加坡": "Singapore", "伦敦": "London",
+    "纽约": "New York", "巴黎": "Paris", "悉尼": "Sydney",
+}
+
+
 def translate_city(city: str) -> str:
-    """用 Groq 免费 API 将中文城市名翻译成英文"""
-    client = OpenAI(
-        api_key=GROQ_API_KEY,
-        base_url="https://api.groq.com/openai/v1",
-    )
-    resp = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{
-            "role": "user",
-            "content": f"将以下城市名翻译成英文，只输出英文城市名，不要任何解释：{city}"
-        }],
-        temperature=0,
-        max_tokens=20,
-    )
-    return resp.choices[0].message.content.strip()
+    """将中文城市名翻译成英文（使用配置的 LLM API）。
+
+    翻译失败或返回空时，回退为原文（OpenWeatherMap 支持中文城市名）。
+    """
+    # 1. 优先查本地对照表（零延迟、零成本）
+    if city in _CITY_MAP:
+        english = _CITY_MAP[city]
+        print(f"   📖 本地翻译: {city} → {english}", file=sys.stderr, flush=True)
+        return english
+
+    # 2. 调用 LLM 翻译
+    try:
+        client = OpenAI(
+            api_key=GROQ_API_KEY,
+            base_url=GROQ_BASE_URL,
+            timeout=10.0,
+        )
+        resp = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{
+                "role": "user",
+                "content": f"将以下城市名翻译成英文，只输出英文城市名，不要任何解释：{city}"
+            }],
+            temperature=0,
+            max_tokens=20,
+        )
+        translated = resp.choices[0].message.content.strip()
+        if translated:
+            print(f"   🌐 LLM 翻译: {city} → {translated}", file=sys.stderr, flush=True)
+            return translated
+    except Exception as e:
+        print(f"   ⚠️ 翻译失败: {e}，使用原文", file=sys.stderr, flush=True)
+
+    # 3. 最终回退
+    return city
 
 
 

@@ -1,17 +1,20 @@
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()  # 从 .env 文件加载环境变量
+# 从 config.py 所在目录加载 .env（兼容任意工作目录启动，如 MCP Inspector）
+_env_path = Path(__file__).resolve().parent / ".env"
+load_dotenv(_env_path)
 
 # ===== DeepSeek API 配置 =====
 # API Key 存放在 .env 文件中，不提交到 Git
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
 
-GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+GROQ_BASE_URL = "https://api.deepseek.com"
 
 # LLM 模型名称
-LLM_MODEL = "llama-3.3-70b-versatile"
+LLM_MODEL = "deepseek-v4-flash"
        
 
 # ===== HuggingFace 镜像配置 =====
@@ -34,3 +37,10 @@ MAX_MEMORY_ROUNDS = 10             # 最多记住 10 轮对话
 
 # ===== 检索配置 =====
 TOP_K = 8                          # 每次检索返回 8 个最相关片段（需覆盖同名Section场景）
+
+# ===== MCP 统一智能体配置 =====
+MCP_MAX_TURNS = 5                  # 最大工具调用轮次（防死循环）
+MCP_TOOL_TOP_N = 5                 # 向量预筛选工具的 Top-N 数量
+MCP_CALL_TIMEOUT = 60.0            # 单次工具调用超时（秒）
+MCP_REFLECTION_MAX = 50            # 反思记忆最大条数
+MCP_HEARTBEAT_INTERVAL = 30.0      # MCP 心跳间隔（秒）

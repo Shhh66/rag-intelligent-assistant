@@ -1,15 +1,37 @@
 import json
+import sys
 import httpx
 from typing import Any
-from config import OPENWEATHER_API_KEY
+from openai import OpenAI
+from config import OPENWEATHER_API_KEY, GROQ_API_KEY
 
 OPENWEATHER_BASE_URL = "https://api.openweathermap.org/data/2.5/weather"
 USER_AGENT = "weather-app/1.0"
 
 
+def translate_city(city: str) -> str:
+    """用 Groq 免费 API 将中文城市名翻译成英文"""
+    client = OpenAI(
+        api_key=GROQ_API_KEY,
+        base_url="https://api.groq.com/openai/v1",
+    )
+    resp = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{
+            "role": "user",
+            "content": f"将以下城市名翻译成英文，只输出英文城市名，不要任何解释：{city}"
+        }],
+        temperature=0,
+        max_tokens=20,
+    )
+    return resp.choices[0].message.content.strip()
+
+
+
 
 async def fetch_weather_data(city: str) -> dict[str, Any] | None:
     """调用 OpenWeatherMap API 获取城市天气数据。"""
+    city = translate_city(city)
     params = {
         "q": city,
         "appid": OPENWEATHER_API_KEY,
@@ -25,11 +47,11 @@ async def fetch_weather_data(city: str) -> dict[str, Any] | None:
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
-            print(f"HTTP 错误: {e.response.status_code} - {e.response.text}")
+            print(f"HTTP 错误: {e.response.status_code} - {e.response.text}", file=sys.stderr, flush=True)
         except httpx.RequestError as e:
-            print(f"请求错误: {e}")
+            print(f"请求错误: {e}", file=sys.stderr, flush=True)
         except Exception as e:
-            print(f"未知错误: {e}")
+            print(f"未知错误: {e}", file=sys.stderr, flush=True)
     return None
 
 

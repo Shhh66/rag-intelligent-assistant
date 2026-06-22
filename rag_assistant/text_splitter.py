@@ -92,31 +92,3 @@ def split_documents(docs: List[Document]) -> List[Document]:
     return enriched_chunks
 
 
-# ===== 自测代码 =====
-if __name__ == "__main__":
-    import sys
-    sys.stdout.reconfigure(encoding="utf-8")
-
-    from document_loader import load_file
-    import os
-
-    # 创建测试文件
-    test_file = "test_split_sample.txt"
-    content = (
-        "第一章：入门指南\n\n"
-        "这是一个很长的测试文档。" * 50 +
-        "第二章：进阶教程\n\n"
-        "这部分包含了更深入的内容。" * 50
-    )
-    with open(test_file, "w", encoding="utf-8") as f:
-        f.write(content)
-
-    # 加载 → 分块
-    docs = load_file(test_file)
-    chunks = split_documents(docs)
-
-    print(f"\n🎉 分块成功！共 {len(chunks)} 个文本块")
-    print(f"第1块预览（前80字）: {chunks[0].page_content[:80]}...")
-    print(f"第1块字数: {len(chunks[0].page_content)}")
-
-    os.remove(test_file)

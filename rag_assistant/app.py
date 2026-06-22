@@ -7,7 +7,7 @@ import streamlit as st
 from document_loader import load_file
 from text_splitter import split_documents
 from vector_store import build_vector_store
-from agent_core import AgentCore
+from agent import Agent
 from evaluation import EvaluationLogger
 
 # ===== 页面设置 =====
@@ -22,7 +22,7 @@ st.caption("基于 RAG + Agent 技术 | 支持 PDF / Word / TXT")
 
 # ===== 初始化会话状态 =====
 if "agent" not in st.session_state:
-    st.session_state.agent = AgentCore()
+    st.session_state.agent = Agent()
 if "logger" not in st.session_state:
     st.session_state.logger = EvaluationLogger()
 if "history" not in st.session_state:

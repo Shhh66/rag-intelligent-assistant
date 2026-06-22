@@ -5,13 +5,14 @@ load_dotenv()  # 从 .env 文件加载环境变量
 
 # ===== DeepSeek API 配置 =====
 # API Key 存放在 .env 文件中，不提交到 Git
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
 
-DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
 # LLM 模型名称
-LLM_MODEL = "deepseek-chat"         # DeepSeek 对话模型，便宜好用
+LLM_MODEL = "llama-3.3-70b-versatile"
+       
 
 # ===== HuggingFace 镜像配置 =====
 # 国内访问 huggingface.co 不稳定，使用 hf-mirror.com 镜像下载模型

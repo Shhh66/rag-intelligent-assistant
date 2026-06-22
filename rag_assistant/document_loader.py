@@ -1,6 +1,7 @@
 """文档加载模块 —— 支持 PDF、Word、TXT 文件"""
 
 import os
+import sys
 from typing import List
 
 from langchain_core.documents import Document
@@ -39,23 +40,8 @@ def load_file(file_path: str) -> List[Document]:
     else:
         raise ValueError(f"不支持的文件类型: {ext}（仅支持 PDF、DOCX、TXT）")
 
-    print(f"   ✅ 已加载: {os.path.basename(file_path)}（{len(docs)} 页/段）")
+    print(f"   ✅ 已加载: {os.path.basename(file_path)}（{len(docs)} 页/段）", file=sys.stderr, flush=True)
     return docs
 
 
-# ===== 自测代码 =====
-if __name__ == "__main__":
-    import sys
-    sys.stdout.reconfigure(encoding="utf-8")
 
-    # 创建测试用的 TXT 文件
-    test_file = "test_sample.txt"
-    with open(test_file, "w", encoding="utf-8") as f:
-        f.write("这是第一段测试内容。\n\n这是第二段测试内容。\n\n这是第三段测试内容。")
-
-    docs = load_file(test_file)
-    print(f"\n🎉 加载成功！共 {len(docs)} 个文档")
-    print(f"预览前100字: {docs[0].page_content[:100]}...")
-
-    # 清理测试文件
-    os.remove(test_file)

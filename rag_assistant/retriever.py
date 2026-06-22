@@ -1,15 +1,16 @@
 """RAG 检索增强生成模块 —— 检索 + 生成回答"""
 
+import sys
 from openai import OpenAI
-from config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, LLM_MODEL, TOP_K
+from config import GROQ_API_KEY, GROQ_BASE_URL, LLM_MODEL, TOP_K
 from vector_store import search
 
 
 def _translate_query_for_search(query: str) -> str:
     """将中文查询翻译为英文关键词，提升英文文档检索命中率"""
-    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+    client = OpenAI(api_key=GROQ_API_KEY, base_url=GROQ_BASE_URL)
     resp = client.chat.completions.create(
-        model=LLM_MODEL,
+        model="llama-3.1-8b-instant",
         messages=[{
             "role": "user",
             "content": f"将以下中文问题翻译为适合英文文档检索的英文关键词（5-10个词即可）：\n\n{query}\n\n只输出英文关键词，不要解释。"
@@ -18,7 +19,7 @@ def _translate_query_for_search(query: str) -> str:
         max_tokens=50,
     )
     en_keywords = resp.choices[0].message.content.strip()
-    print(f"   🌐 英文检索词: {en_keywords}")
+    print(f"   🌐 英文检索词: {en_keywords}", file=sys.stderr)
     return en_keywords
 
 
@@ -58,26 +59,26 @@ def answer_with_fallback(query: str, top_k: int = TOP_K) -> str:
     db_error = False
 
     try:
-        print(f"   🔍 中文检索: {query[:40]}...")
+        print(f"   🔍 中文检索: {query[:40]}...", file=sys.stderr)
         docs_cn = search(query, top_k=top_k)
-        print(f"      找到 {len(docs_cn)} 个片段")
+        print(f"      找到 {len(docs_cn)} 个片段", file=sys.stderr)
     except Exception as e:
         db_error = True
-        print(f"   ⚠️ 检索失败: {e}")
+        print(f"   ⚠️ 检索失败: {e}", file=sys.stderr)
 
     if not db_error:
         try:
             en_query = _translate_query_for_search(query)
-            print(f"   🔍 英文检索: {en_query}")
+            print(f"   🔍 英文检索: {en_query}", file=sys.stderr)
             docs_en = search(en_query, top_k=top_k)
-            print(f"      找到 {len(docs_en)} 个片段")
+            print(f"      找到 {len(docs_en)} 个片段", file=sys.stderr)
         except Exception as e:
-            print(f"   ⚠️ 英文检索失败: {e}")
+            print(f"   ⚠️ 英文检索失败: {e}", file=sys.stderr)
 
     # 2. 无知识库或检索失败 → LLM 直接回答
     if db_error or (not docs_cn and not docs_en):
-        print(f"   ⚠️ 知识库不可用，LLM 直接回答")
-        client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+        print(f"   ⚠️ 知识库不可用，LLM 直接回答", file=sys.stderr)
+        client = OpenAI(api_key=GROQ_API_KEY, base_url=GROQ_BASE_URL)
         response = client.chat.completions.create(
             model=LLM_MODEL,
             messages=[{"role": "user", "content": query}],
@@ -95,12 +96,12 @@ def answer_with_fallback(query: str, top_k: int = TOP_K) -> str:
         if key not in seen:
             seen.add(key)
             merged.append(doc)
-    print(f"   📄 合并去重后共 {len(merged)} 个片段")
+    print(f"   📄 合并去重后共 {len(merged)} 个片段", file=sys.stderr)
 
     # 2. 构建 Prompt 并调用 LLM
     prompt = build_prompt(query, merged)
 
-    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+    client = OpenAI(api_key=GROQ_API_KEY, base_url=GROQ_BASE_URL)
     response = client.chat.completions.create(
         model=LLM_MODEL,
         messages=[{"role": "user", "content": prompt}],
@@ -110,50 +111,3 @@ def answer_with_fallback(query: str, top_k: int = TOP_K) -> str:
 
     answer = response.choices[0].message.content
     return answer
-
-
-# ===== 自测代码 =====
-if __name__ == "__main__":
-    import sys
-    sys.stdout.reconfigure(encoding="utf-8")
-
-    from document_loader import load_file
-    from text_splitter import split_documents
-    from vector_store import build_vector_store
-    import os
-
-    # 1. 构建测试知识库
-    test_file = "test_rag_sample.txt"
-    with open(test_file, "w", encoding="utf-8") as f:
-        f.write(
-            "LangChain 是一个用于构建大语言模型应用的开源框架。"
-            "它提供了链式调用、Agent 编排、工具集成等功能。\n\n"
-            "RAG 全称是 Retrieval-Augmented Generation，即检索增强生成。"
-            "它先检索相关文档，再将文档作为上下文注入大模型的 Prompt 中，"
-            "从而减少幻觉、提高回答准确性。\n\n"
-            "ChromaDB 是一个开源的向量数据库，专门用于存储和检索文本嵌入向量。"
-            "它支持多种嵌入模型，可以方便地与 LangChain 集成。\n\n"
-            "Agent 是具备自主决策能力的智能体，能根据任务目标选择工具、"
-            "制定计划并执行。LangChain 提供了 Agent 的实现框架。"
-        )
-
-    print("=== 构建测试知识库 ===")
-    docs = load_file(test_file)
-    chunks = split_documents(docs)
-    build_vector_store(chunks)
-
-    # 2. 测试统问答
-    print("\n=== RAG 问答测试 ===\n")
-    test_queries = [
-        "什么是 RAG？",
-        "LangChain 有哪些功能？",
-        "今天天气怎么样？",  # 知识库中没有的 → 触发兜底
-    ]
-    for q in test_queries:
-        print(f"👤 问题: {q}")
-        answer = answer_with_fallback(q)
-        print(f"🤖 回答: {answer}\n")
-        print("-" * 50 + "\n")
-
-    print("🎉 RAG 模块测试完成！")
-    os.remove(test_file)

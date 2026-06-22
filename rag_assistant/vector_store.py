@@ -1,6 +1,7 @@
 """向量嵌入与存储模块 —— 将文本块向量化并存入 ChromaDB"""
 
 import os
+import sys
 from typing import List
 from pathlib import Path
 
@@ -33,7 +34,7 @@ def get_embeddings():
 
         if _model_is_cached():
             # 已缓存：离线加载，不走网络
-            print(f"   ⏳ 加载本地嵌入模型（使用缓存，离线模式）...")
+            print(f"   ⏳ 加载本地嵌入模型（使用缓存，离线模式）...", file=sys.stderr, flush=True)
             _embeddings = HuggingFaceEmbeddings(
                 model_name=model_name,
                 model_kwargs={"device": "cpu", "local_files_only": True},
@@ -42,12 +43,12 @@ def get_embeddings():
             # 未缓存：从镜像下载
             if "HF_ENDPOINT" not in os.environ:
                 os.environ["HF_ENDPOINT"] = HF_ENDPOINT
-            print(f"   ⏳ 下载嵌入模型（镜像: {HF_ENDPOINT}，仅首次需要）...")
+            print(f"   ⏳ 下载嵌入模型（镜像: {HF_ENDPOINT}，仅首次需要）...", file=sys.stderr, flush=True)
             _embeddings = HuggingFaceEmbeddings(
                 model_name=model_name,
                 model_kwargs={"device": "cpu"},
             )
-        print(f"   ✅ 嵌入模型加载完成: {EMBEDDING_MODEL}")
+        print(f"   ✅ 嵌入模型加载完成: {EMBEDDING_MODEL}", file=sys.stderr, flush=True)
     return _embeddings
 
 
@@ -63,18 +64,18 @@ def build_vector_store(docs: List[Document]) -> Chroma:
     client = chromadb.PersistentClient(path=str(db_path))
     try:
         client.delete_collection("langchain")
-        print("   🗑 已清空旧向量库")
+        print("   🗑 已清空旧向量库", file=sys.stderr, flush=True)
     except Exception:
         pass  # 首次构建，不存在旧集合
 
-    print(f"   📊 正在向量化 {len(docs)} 个文本块...")
+    print(f"   📊 正在向量化 {len(docs)} 个文本块...", file=sys.stderr, flush=True)
     vector_store = Chroma.from_documents(
         documents=docs,
         embedding=embeddings,
         persist_directory=str(db_path),
         collection_name="langchain",
     )
-    print(f"   ✅ 向量库构建完成！存储位置: {VECTOR_DB_PATH}")
+    print(f"   ✅ 向量库构建完成！存储位置: {VECTOR_DB_PATH}", file=sys.stderr, flush=True)
     return vector_store
 
 
@@ -132,19 +133,3 @@ if __name__ == "__main__":
 
     print("\n=== Step 3: 构建向量库 ===")
     build_vector_store(chunks)
-
-    # 3. 测试检索
-    print("\n=== Step 4: 测试检索 ===")
-    test_queries = [
-        "什么是机器学习？",
-        "Python在AI中有什么地位？",
-        "RAG是什么？",
-    ]
-    for q in test_queries:
-        print(f"\n🔍 问题: {q}")
-        results = search(q, top_k=2)
-        for i, doc in enumerate(results, 1):
-            print(f"   第{i}名（相似度）: {doc.page_content[:100]}...")
-
-    print("\n🎉 向量库模块全部通过！")
-    os.remove(test_file)

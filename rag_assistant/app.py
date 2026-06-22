@@ -1,4 +1,4 @@
-"""Streamlit Web 界面 —— 知识库问答系统的前端"""
+"""Streamlit Web 界面 —— MCP 统一智能体的前端"""
 
 import os
 import time
@@ -12,13 +12,13 @@ from evaluation import EvaluationLogger
 
 # ===== 页面设置 =====
 st.set_page_config(
-    page_title="智能知识库问答助手",
-    page_icon="📚",
+    page_title="MCP 统一智能体",
+    page_icon="🤖",
     layout="wide",
 )
 
-st.title("📚 智能知识库问答助手")
-st.caption("基于 RAG + Agent 技术 | 支持 PDF / Word / TXT")
+st.title("🤖 MCP 统一智能体")
+st.caption("LLM 自主决策 · MCP 工具调度 · RAG 知识库问答 | 支持 PDF / Word / TXT")
 
 # ===== 初始化会话状态 =====
 if "agent" not in st.session_state:

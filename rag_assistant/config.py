@@ -6,6 +6,8 @@ load_dotenv()  # 从 .env 文件加载环境变量
 # ===== DeepSeek API 配置 =====
 # API Key 存放在 .env 文件中，不提交到 Git
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
+
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
 # LLM 模型名称

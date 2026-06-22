@@ -1,0 +1,14 @@
+streamlit>=1.57
+openai>=2.38
+httpx>=0.28
+mcp>=1.28
+chromadb>=1.5
+langchain-core>=1.4
+langchain-chroma>=1.1
+langchain-huggingface>=1.2
+sentence-transformers>=5.5
+docx2txt>=0.9
+pypdf>=6.12
+jsonschema>=4.26
+numpy>=2.4
+python-dotenv>=1.0

@@ -9,6 +9,7 @@ from text_splitter import split_documents
 from vector_store import build_vector_store
 from agent import Agent
 from evaluation import EvaluationLogger
+from token_tracker import get_tracker
 
 # ===== 页面设置 =====
 st.set_page_config(
@@ -69,10 +70,43 @@ with st.sidebar:
     else:
         st.warning("📊 知识库状态：未构建（请先上传文档）")
 
+    # Token 用量展示
+    st.divider()
+    st.header("💰 Token 用量")
+    tracker = get_tracker()
+
+    # ── 层次1：本次问答 ──
+    conv = tracker.get_conversation_diff()
+    if conv["call_count"] > 0:
+        st.subheader("📝 本次问答")
+        st.caption(
+            f"Token: {conv['total_tokens']:,} "
+            f"(入 {conv['total_input']:,} / 出 {conv['total_output']:,})"
+        )
+        st.caption(f"调用 {conv['call_count']} 次 · ¥{conv['total_cost']:.4f}")
+
+    # ── 层次2：本次会话累计 ──
+    sess = tracker.get_session_summary()
+    if sess["call_count"] > 0:
+        st.subheader("📊 本次会话累计")
+        st.metric("LLM 调用次数", sess["call_count"])
+        st.metric("总 Token", f"{sess['total_tokens']:,}")
+        st.metric("预估费用", f"¥{sess['total_cost']:.4f}")
+
+    # ── 层次3：历史总计 ──
+    hist = tracker.get_all_time_summary()
+    if hist["call_count"] > 0:
+        st.subheader("📈 历史总计")
+        st.caption(f"共 {hist['call_count']} 次调用")
+        st.caption(f"累计 Token: {hist['total_tokens']:,}")
+        st.caption(f"累计费用: ¥{hist['total_cost']:.4f}")
+    else:
+        st.caption("暂无 LLM 调用记录")
+
     # 清空对话按钮
     st.divider()
     if st.button("🗑 清空对话历史", use_container_width=True):
-        st.session_state.agent.memory.clear()
+        st.session_state.agent.clear_memory()
         st.session_state.history = []
         st.rerun()
 
@@ -102,6 +136,17 @@ if user_input:
             # 显示回答
             st.write(answer)
 
+            # 显示本次问答的 Token 用量
+            tracker = get_tracker()
+            conv = tracker.get_conversation_diff()
+            if conv["call_count"] > 0:
+                st.caption(
+                    f"📊 Token: {conv['total_tokens']:,} "
+                    f"(入 {conv['total_input']:,} / 出 {conv['total_output']:,}) "
+                    f"· 调用 {conv['call_count']} 次 "
+                    f"· 💰 ¥{conv['total_cost']:.4f}"
+                )
+
             # 记录日志
             latency = (time.time() - start_time) * 1000
             st.session_state.logger.log(
@@ -110,6 +155,7 @@ if user_input:
                 intent="knowledge",
                 top_docs=[],
                 latency_ms=latency,
+                token_usage=conv,
             )
 
         except Exception as e:
@@ -117,3 +163,5 @@ if user_input:
             answer = f"抱歉，处理时出现错误: {str(e)}"
 
     st.session_state.history.append({"role": "assistant", "content": answer})
+    # 立即刷新页面，让侧边栏的 Token 统计同步更新
+    st.rerun()

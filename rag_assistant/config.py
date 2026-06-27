@@ -44,3 +44,20 @@ MCP_TOOL_TOP_N = 5                 # 向量预筛选工具的 Top-N 数量
 MCP_CALL_TIMEOUT = 60.0            # 单次工具调用超时（秒）
 MCP_REFLECTION_MAX = 50            # 反思记忆最大条数
 MCP_HEARTBEAT_INTERVAL = 30.0      # MCP 心跳间隔（秒）
+
+# ===== Token 计费配置 =====
+# 单位：¥ / 1M tokens（DeepSeek 官方定价 2025）
+# deepseek-chat:      ¥1  input,  ¥2  output
+# deepseek-v4-flash:  ¥1  input,  ¥2  output（采用 deepseek-chat 同价）
+# deepseek-reasoner:  ¥4  input, ¥16  output
+MODEL_PRICING = {
+    "deepseek-chat":       {"input": 1.0,  "output": 2.0},
+    "deepseek-v4-flash":   {"input": 1.0,  "output": 2.0},
+    "deepseek-reasoner":   {"input": 4.0,  "output": 16.0},
+}
+# 未在 MODEL_PRICING 中配置的模型使用此默认定价
+DEFAULT_PRICING = {"input": 1.0, "output": 2.0}
+
+# 上下文窗口 Token 上限（DeepSeek V4 系列为 128K）
+MAX_CONTEXT_TOKENS = 128000
+CONTEXT_WARNING_RATIO = 0.8  # Prompt Token 达到窗口 80% 时发出告警

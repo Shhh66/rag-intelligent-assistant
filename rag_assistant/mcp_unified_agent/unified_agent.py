@@ -18,6 +18,8 @@ import sys
 import time
 from pathlib import Path
 
+from token_tracker import get_tracker
+
 from openai import OpenAI
 from mcp.client.stdio import stdio_client
 from mcp import ClientSession, StdioServerParameters
@@ -148,6 +150,8 @@ class UnifiedAgent:
         避免嵌套 __aenter__ 在 Windows 上的兼容问题。
         """
         start_time = time.time()
+        # 标记新一轮对话开始（不重置历史数据）
+        get_tracker().start_conversation()
 
         params = StdioServerParameters(
             command=self.server_command,
@@ -195,7 +199,14 @@ class UnifiedAgent:
                 )
 
                 elapsed = (time.time() - start_time) * 1000
-                logger.info(f"run 完成: {elapsed:.0f}ms")
+                # 记录本次对话的 Token 用量汇总
+                summary = get_tracker().get_session_summary()
+                logger.info(
+                    f"run 完成: {elapsed:.0f}ms | "
+                    f"Token: {summary['total_tokens']:,} "
+                    f"(in={summary['total_input']:,}, out={summary['total_output']:,}) | "
+                    f"费用: ¥{summary['total_cost']:.6f}"
+                )
                 return answer
 
     async def _warm_up(self, mcp_client: MCPSession) -> None:

@@ -4,6 +4,7 @@ import httpx
 from typing import Any
 from openai import OpenAI
 from config import OPENWEATHER_API_KEY, GROQ_API_KEY, GROQ_BASE_URL, LLM_MODEL
+from token_tracker import get_tracker
 
 OPENWEATHER_BASE_URL = "https://api.openweathermap.org/data/2.5/weather"
 USER_AGENT = "weather-app/1.0"
@@ -63,6 +64,7 @@ def translate_city(city: str) -> str:
         )
         translated = resp.choices[0].message.content.strip()
         if translated:
+            get_tracker().record(LLM_MODEL, resp.usage, call_site="weather.translate_city")
             print(f"   🌐 LLM 翻译: {city} → {translated}", file=sys.stderr, flush=True)
             return translated
     except Exception as e:

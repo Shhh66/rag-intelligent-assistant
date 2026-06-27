@@ -4,6 +4,7 @@ import sys
 from openai import OpenAI
 from config import GROQ_API_KEY, GROQ_BASE_URL, LLM_MODEL, TOP_K
 from vector_store import search
+from token_tracker import get_tracker
 
 
 def _translate_query_for_search(query: str) -> str:
@@ -19,6 +20,7 @@ def _translate_query_for_search(query: str) -> str:
         max_tokens=50,
     )
     en_keywords = resp.choices[0].message.content.strip()
+    get_tracker().record(LLM_MODEL, resp.usage, call_site="retriever.translate_query")
     print(f"   🌐 英文检索词: {en_keywords}", file=sys.stderr)
     return en_keywords
 
@@ -86,6 +88,7 @@ def answer_with_fallback(query: str, top_k: int = TOP_K) -> str:
             max_tokens=2000,
         )
         answer = response.choices[0].message.content
+        get_tracker().record(LLM_MODEL, response.usage, call_site="retriever.direct_answer")
         return answer + "\n\n> ⚠️ 本回答并非基于上传的知识库文档，由大模型直接生成。"
 
     # 3. 合并去重
@@ -110,4 +113,5 @@ def answer_with_fallback(query: str, top_k: int = TOP_K) -> str:
     )
 
     answer = response.choices[0].message.content
+    get_tracker().record(LLM_MODEL, response.usage, call_site="retriever.rag_answer")
     return answer

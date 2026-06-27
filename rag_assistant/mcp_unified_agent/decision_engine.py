@@ -14,6 +14,8 @@ from typing import Literal
 
 from openai import OpenAI
 
+from token_tracker import get_tracker
+
 from .prompt_templates import (
     build_decision_prompt,
     build_final_answer_prompt,
@@ -97,6 +99,7 @@ class DecisionEngine:
                 max_tokens=600,
             )
             raw_text = response.choices[0].message.content or ""
+            get_tracker().record(self.model, response.usage, call_site="decision_engine.decide")
             logger.debug(f"LLM 决策原始输出: {raw_text[:300]}")
             return self._parse_decision(raw_text)
 
@@ -140,7 +143,9 @@ class DecisionEngine:
                 temperature=0.3,
                 max_tokens=800,
             )
-            return response.choices[0].message.content or "（无回答）"
+            content = response.choices[0].message.content or "（无回答）"
+            get_tracker().record(self.model, response.usage, call_site="decision_engine.final_answer")
+            return content
         except Exception as e:
             logger.error(f"最终回答生成失败: {e}")
             return f"抱歉，生成最终回答时出现错误: {e}"

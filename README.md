@@ -37,6 +37,34 @@ streamlit run app.py
 
 浏览器打开 `http://localhost:8501`，上传 PDF/Word/TXT 文档，点击"构建知识库"即可开始问答。
 
+## 架构演进
+
+项目正在从「MCP + JSON 决策」向「MCP + ReAct + Skills」三层架构演进：
+
+```
+当前架构（v1）                    目标架构（v2）
+══════════════                    ══════════════
+用户输入                          用户输入
+  │                                 │
+  ▼                                 ▼
+JSON 决策引擎                   ┌─ Skill 匹配 ─┐
+  │                             │ 命中 → 1轮执行 │
+  ▼                             │ 未命中 ↓       │
+MCP 工具 串行/并行              │ ReAct 推理循环  │
+  │                             └──────┬────────┘
+  ▼                                    ▼
+LLM 汇总回答                      MCP 工具执行
+                                     │
+                                     ▼
+                                 LLM 汇总回答
+```
+
+- **MCP 层**（不变）：标准化工具接入，自动发现
+- **Skills 层**（新增）：工具组合声明式定义，高频模式一次沉淀反复复用
+- **ReAct 层**（替代 JSON 决策）：Thought→Action→Observation 自然推理，LLM 自主决定何时终止
+
+详见 `CLAUDE.md` 中的「Skills 架构设计」章节。
+
 ## 功能
 
 - **智能工具调度**：LLM 根据问题自动判断是否需要工具、用哪个、串行还是并行
@@ -52,21 +80,30 @@ rag_assistant/
 ├── app.py                  # Streamlit 界面
 ├── agent.py                # Agent 入口（继承 UnifiedAgent）
 ├── mcp_server.py           # MCP 工具注册（FastMCP）
-├── config.py               # 全局配置
+├── config.py               # 全局配置（含 LLM 定价）
 ├── retriever.py            # RAG 检索：双语检索 + Prompt 构建
 ├── vector_store.py         # ChromaDB 向量存储
 ├── Weather_search.py       # 天气工具：翻译 + API
 ├── document_loader.py      # 文档加载（PDF/Word/TXT）
-├── text_splitter.py        # 文本分块
-├── evaluation.py           # 问答日志
+├── text_splitter.py        # 文本分块（含结构标注）
+├── evaluation.py           # 问答日志（含 Token/费用追踪）
+├── token_tracker.py        # Token 用量追踪：会话累积 + 持久化
+├── skills/                 # 技能组合层（新增）
+│   ├── builtin/
+│   │   ├── comprehensive_query.py  # 综合查询
+│   │   ├── weather_advice.py       # 天气出行建议
+│   │   └── deep_kb_search.py       # 深度知识库检索
+│   └── __init__.py         # Skill 自动发现
 └── mcp_unified_agent/      # 智能体核心
-    ├── unified_agent.py    # 编排调度
-    ├── decision_engine.py  # LLM 结构化 JSON 决策
+    ├── unified_agent.py    # 编排调度（含 Skill 匹配集成）
+    ├── decision_engine.py  # ReAct 决策引擎（Thought→Action→Obs）
     ├── scheduler.py        # 串行/并行工具执行
     ├── tool_registry.py    # 工具元数据缓存 + Schema 校验
-    ├── prompt_templates.py # 决策和回答 Prompt
-    ├── tool_vector_filter.py   # 向量预筛选（可选）
-    ├── reflection_memory.py    # 反思记忆（可选）
+    ├── skill_registry.py   # Skill 注册表：加载 + 匹配
+    ├── skill_executor.py   # Skill 执行器：参数校验 + 降级
+    ├── prompt_templates.py # ReAct Prompt 模板
+    ├── tool_vector_filter.py   # 向量预筛选
+    ├── reflection_memory.py    # 反思记忆
     └── mcp_client_manager.py   # MCP 会话封装
 ```
 

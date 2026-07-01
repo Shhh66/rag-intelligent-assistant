@@ -19,8 +19,10 @@ from token_tracker import get_tracker
 from .prompt_templates import (
     build_decision_prompt,
     build_final_answer_prompt,
+    build_skill_recognition_prompt,
 )
 from .tool_registry import ToolMeta
+from .skill_registry import SkillRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -36,10 +38,21 @@ class ToolDecision:
 @dataclass
 class AgentDecision:
     """LLM 的完整决策"""
-    action: Literal["direct_answer", "call_tools"]
+    action: Literal["direct_answer", "call_tools", "call_skill"]
     tools: list[ToolDecision] = field(default_factory=list)
     execution_mode: str = "serial"
     direct_response: str | None = None
+    skill_name: str = ""       # call_skill 时的 Skill 名
+    skill_args: dict = field(default_factory=dict)  # call_skill 时的参数
+
+
+@dataclass
+class SkillMatchResult:
+    """Skill 匹配 + 参数提取的完整结果"""
+    skill_name: str
+    confidence: float
+    args: dict
+    raw_response: str = ""
 
 
 class DecisionEngine:
@@ -96,7 +109,7 @@ class DecisionEngine:
                 model=self.model,
                 messages=messages,
                 temperature=0.1,
-                max_tokens=600,
+                max_tokens=4000,
             )
             raw_text = response.choices[0].message.content or ""
             get_tracker().record(self.model, response.usage, call_site="decision_engine.decide")
@@ -141,7 +154,7 @@ class DecisionEngine:
                 model=self.model,
                 messages=messages,
                 temperature=0.3,
-                max_tokens=800,
+                max_tokens=4000,
             )
             content = response.choices[0].message.content or "（无回答）"
             get_tracker().record(self.model, response.usage, call_site="decision_engine.final_answer")
@@ -227,3 +240,242 @@ class DecisionEngine:
             tools=tools,
             execution_mode=execution_mode,
         )
+
+    # ── Skill 确认 + 参数提取 ──────────────────────────────────
+
+    def match_skill(
+        self,
+        user_input: str,
+        history: list[dict],
+        candidate_skills: list[dict],
+    ) -> SkillMatchResult | None:
+        """用 LLM 确认最佳匹配 Skill + 提取参数。
+
+        Args:
+            candidate_skills: SkillRegistry.match() 返回的 Top3 候选
+
+        Returns:
+            SkillMatchResult 或 None（LLM 判断都不匹配）
+        """
+        temp_registry = SkillRegistry()
+        temp_registry._skills = candidate_skills
+        skills_desc = temp_registry.format_for_prompt(candidate_skills)
+
+        prompt = build_skill_recognition_prompt(
+            user_input=user_input,
+            history=history,
+            skills_description=skills_desc,
+        )
+
+        messages = [
+            {"role": "system", "content": "你是一个精确的技能匹配引擎，只输出指定格式。"},
+            {"role": "user", "content": prompt},
+        ]
+
+        for attempt in range(2):  # 解析失败允许重试 1 次
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=0.1,
+                    max_tokens=4000,
+                )
+                raw_text = response.choices[0].message.content or ""
+                get_tracker().record(self.model, response.usage,
+                                     call_site="decision_engine.match_skill")
+                logger.debug(f"Skill 确认原始输出: {raw_text[:200]}")
+                result = self._parse_skill_result(raw_text)
+                if result is not None:
+                    return result
+                # 解析失败 → 重试
+                if attempt == 0:
+                    messages.append({
+                        "role": "assistant", "content": raw_text
+                    })
+                    messages.append({
+                        "role": "user",
+                        "content": "格式错误，请严格按照 SKILL: <技能名>\\n参数: ```json {...}``` 格式输出"
+                    })
+            except Exception as e:
+                logger.error(f"Skill 匹配 LLM 调用失败: {e}")
+                break
+
+        return None
+
+    def _parse_skill_result(self, raw_text: str) -> SkillMatchResult | None:
+        """解析 LLM 的 Skill 确认输出。"""
+        if not raw_text or "none" in raw_text.lower().split("\n")[0]:
+            return None
+
+        # 提取 SKILL: <name>
+        skill_match = re.search(r'SKILL:\s*(\S+)', raw_text)
+        if not skill_match:
+            return None
+        skill_name = skill_match.group(1)
+        if skill_name.lower() == "none":
+            return None
+
+        # 提取置信度
+        conf_match = re.search(r'置信度:\s*([\d.]+)', raw_text)
+        confidence = float(conf_match.group(1)) if conf_match else 0.7
+
+        # 提取参数
+        args = self._extract_json_block(raw_text) or {}
+
+        logger.info(
+            f"Skill 确认: {skill_name} (置信度={confidence:.2f}, "
+            f"参数={list(args.keys())})"
+        )
+        return SkillMatchResult(
+            skill_name=skill_name,
+            confidence=confidence,
+            args=args,
+            raw_response=raw_text,
+        )
+
+    # ── ReAct 输出解析 ────────────────────────────────────────
+
+    def decide_with_skills(
+        self,
+        user_input: str,
+        history: list[dict],
+        tools: list[ToolMeta],
+        reflection_hints: list[str],
+        skills_candidates: list[dict] | None = None,
+    ) -> AgentDecision:
+        """增强版决策：优先 Skill 匹配 + ReAct 推理。
+
+        返回 AgentDecision，action 可能是 call_skill / call_tools / direct_answer。
+        """
+        from .tool_registry import ToolRegistry
+        temp_registry = ToolRegistry()
+        temp_registry.load(tools)
+        tools_description = temp_registry.format_for_prompt()
+
+        # 格式化 Skills 描述（只放 Top3，不放全量）
+        if skills_candidates:
+            temp_skill_reg = SkillRegistry()
+            temp_skill_reg._skills = skills_candidates
+            skills_description = temp_skill_reg.format_for_prompt(skills_candidates)
+        else:
+            skills_description = ""
+
+        # 可用工具列表里也注入 Skill 名（让 ReAct 可以调 Skill）
+        if skills_candidates:
+            skill_tool_lines = ["\n## 可调用的技能（作为高级工具使用）"]
+            for s in skills_candidates:
+                skill_tool_lines.append(
+                    f"### {s['name']}\n描述：{s['description']}\n"
+                    f"参数：{', '.join(s.get('arg_slots', {}).keys())}"
+                )
+            tools_description += "\n".join(skill_tool_lines)
+
+        prompt = build_decision_prompt(
+            user_input=user_input,
+            history=history,
+            tools_description=tools_description,
+            reflection_hints=reflection_hints,
+            skills_description=skills_description,
+        )
+
+        messages = [
+            {"role": "system", "content": "你是一个使用 ReAct 模式推理的智能助手决策引擎。"},
+            {"role": "user", "content": prompt},
+        ]
+
+        for attempt in range(2):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=0.1,
+                    max_tokens=4000,
+                )
+                raw_text = response.choices[0].message.content or ""
+                get_tracker().record(self.model, response.usage,
+                                     call_site="decision_engine.decide")
+                logger.debug(f"ReAct 决策原始输出: {raw_text[:300]}")
+                decision = self._parse_react_output(raw_text)
+                if decision is not None:
+                    return decision
+
+                # 重试
+                if attempt == 0:
+                    messages.append({"role": "assistant", "content": raw_text})
+                    messages.append({
+                        "role": "user",
+                        "content": "格式有误。请按指定格式输出：SKILL/Thought→Action/Final Answer。"
+                    })
+            except Exception as e:
+                logger.error(f"ReAct 决策调用失败: {e}")
+                break
+
+        logger.warning(
+            f"ReAct 决策解析失败（2次尝试），LLM 最后输出前200字: "
+            f"{raw_text[:200] if raw_text else '(空)'}"
+        )
+        return AgentDecision(
+            action="direct_answer",
+            direct_response=(
+                "抱歉，我暂时无法处理这个请求。可能是问题涉及的步骤太多"
+                "（如需要同时查询大量城市的天气），建议分批次提问。"
+            ),
+        )
+
+    def _parse_react_output(self, raw_text: str) -> AgentDecision | None:
+        """解析 ReAct 格式输出（含 SKILL 指令）。
+
+        支持格式：
+        - SKILL: <name>\\n参数: ```json {...}```
+        - Thought: ...\\nAction: <tool>\\n参数: ```json {...}```
+        - {"action":"direct_answer","response":"..."}
+        """
+        if not raw_text:
+            return None
+
+        text = raw_text.strip()
+
+        # 检测 SKILL 指令
+        skill_match = re.search(r'SKILL:\s*(\S+)', text)
+        if skill_match:
+            skill_name = skill_match.group(1)
+            args = self._extract_json_block(text) or {}
+            logger.info(f"ReAct 输出: SKILL {skill_name}")
+            return AgentDecision(
+                action="call_skill",
+                skill_name=skill_name,
+                skill_args=args,
+            )
+
+        # 检测 Thought/Action（ReAct 格式）
+        action_match = re.search(r'Action:\s*(\S+)', text)
+        thought_match = re.search(r'Thought:\s*(.+?)(?:\n|$)', text)
+
+        if action_match:
+            tool_name = action_match.group(1)
+            args = self._extract_json_block(text) or {}
+            thought = thought_match.group(1).strip()[:200] if thought_match else ""
+
+            return AgentDecision(
+                action="call_tools",
+                tools=[ToolDecision(
+                    tool_name=tool_name,
+                    arguments=args,
+                    reason=thought,
+                )],
+                execution_mode="serial",
+            )
+
+        # 回退：尝试 JSON 解析
+        return self._parse_decision(text)
+
+    @staticmethod
+    def _extract_json_block(text: str) -> dict | None:
+        """从文本中提取 ```json ... ``` 代码块。"""
+        match = re.search(r'```json\s*(.*?)\s*```', text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(1))
+            except json.JSONDecodeError:
+                pass
+        return None

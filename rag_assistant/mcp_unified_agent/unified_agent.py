@@ -1,9 +1,10 @@
 """MCP 统一智能体 —— 主入口
 
-完整流水线：
+完整流水线（v2：ReAct + Skills）：
+0. Skill 匹配    → 关键词+向量双重匹配 Top3 候选
 1. 工具预筛选    → 向量检索 top-N 候选工具
-2. LLM 决策      → 构建 Prompt，LLM 输出结构化决策（direct_answer / call_tools）
-3. MCP 调度执行  → 串行或并行调用 MCP 工具
+2. LLM 决策      → ReAct 推理（SKILL / Thought→Action→Obs / direct_answer）
+3. 执行          → Skill 执行器 或 MCP 调度器
 4. 结果回填      → 工具结果注入上下文，回到步骤 2（最多 max_turns 轮）
 5. 最终回答      → LLM 汇总所有工具结果，生成回答
 6. 反思记忆      → 记录工具选择，供未来参考
@@ -26,8 +27,10 @@ from mcp import ClientSession, StdioServerParameters
 
 from .mcp_client_manager import MCPSession
 from .tool_registry import ToolRegistry
-from .decision_engine import DecisionEngine
+from .decision_engine import DecisionEngine, SkillMatchResult
 from .scheduler import Scheduler
+from .skill_registry import SkillRegistry
+from .skill_executor import SkillExecutor, SkillExecutionError
 
 # 可选模块
 try:
@@ -79,6 +82,7 @@ class UnifiedAgent:
         # 持久状态（跨 chat() 调用保留）
         self._history: list[dict] = []       # 对话历史
         self._reflection: ReflectionMemory | None = None  # 反思记忆
+        self._skill_registry: SkillRegistry | None = None  # Skill 注册表
 
         # 工具向量索引（懒加载，首次 chat() 时构建并缓存）
         self._tool_filter: ToolVectorFilter | None = None
@@ -234,6 +238,12 @@ class UnifiedAgent:
                 except Exception as e:
                     logger.warning(f"向量索引构建失败（跳过预筛选）: {e}")
 
+            # 初始化 Skill 注册表
+            if self._skill_registry is None:
+                self._skill_registry = SkillRegistry()
+                skill_count = self._skill_registry.load_all()
+                logger.info(f"Skill 注册表初始化完成: {skill_count} 个 Skill")
+
             # 初始化反思记忆
             if HAS_REFLECTION and self._reflection is None:
                 max_entries = self._get_config_int("MCP_REFLECTION_MAX", 50)
@@ -264,17 +274,68 @@ class UnifiedAgent:
         decision_engine: DecisionEngine,
         scheduler: Scheduler,
     ) -> str:
-        """完整的异步流水线。
+        """完整的异步流水线（v2：Skill 匹配 + ReAct 循环）。
 
-        for turn in range(max_turns):
-            1. 工具预筛选
-            2. LLM 决策
-            3. 直接回答 → 返回
-            4. 执行工具调用
-            5. 记录反思
-            6. 继续或汇总
+        0. Skill 匹配（前置）→ 命中则 1 轮执行
+        1-N. ReAct 循环 → Thought→Action→Obs → Final Answer
         """
         all_results: list[dict] = []
+
+        # ═══ 步骤 0：Skill 匹配（前置，仅首轮） ═══
+        if self._skill_registry and self._skill_registry.count > 0:
+            candidates = self._skill_registry.match(user_input)
+            if candidates:
+                logger.info(
+                    f"Skill 候选: "
+                    + ", ".join(f"{c['skill']['name']}({c['score']:.2f})"
+                                for c in candidates)
+                )
+                # LLM 确认 + 提取参数
+                skill_result = decision_engine.match_skill(
+                    user_input=user_input,
+                    history=self._history,
+                    candidate_skills=[c["skill"] for c in candidates],
+                )
+                if skill_result and skill_result.confidence >= 0.5:
+                    skill = self._skill_registry.get(skill_result.skill_name)
+                    if skill:
+                        logger.info(
+                            f"Skill 确认: {skill_result.skill_name} "
+                            f"(置信度={skill_result.confidence:.2f}, "
+                            f"参数={list(skill_result.args.keys())})"
+                        )
+                        try:
+                            executor = SkillExecutor(
+                                mcp_session,
+                                step_timeout=self.call_timeout,
+                            )
+                            answer = await executor.execute(
+                                skill, skill_result.args
+                            )
+                            # 记录执行日志
+                            for log_entry in executor.get_logs():
+                                logger.info(
+                                    f"[SkillLog] {log_entry['event']}: "
+                                    f"{log_entry['message']}"
+                                )
+                            self._record_conversation(user_input, answer)
+                            return answer
+                        except SkillExecutionError as e:
+                            logger.warning(
+                                f"Skill 执行失败，降级到 ReAct: {e}"
+                            )
+                            # 无感降级：继续执行下方 ReAct 循环
+                else:
+                    logger.info(
+                        f"Skill 匹配未确认"
+                        f"{f' (置信度={skill_result.confidence:.2f})' if skill_result else ''}"
+                        f"，进入 ReAct 循环"
+                    )
+
+        # ═══ 步骤 1-N：ReAct 推理循环 ═══
+        skills_list = (
+            self._skill_registry.get_all() if self._skill_registry else []
+        )
 
         for turn in range(self.max_turns):
             logger.info(f"=== 第 {turn + 1}/{self.max_turns} 轮决策 ===")
@@ -300,16 +361,22 @@ class UnifiedAgent:
                         f"{str(r.get('result', ''))[:120]}"
                     )
 
-            # 3. LLM 决策
-            decision = decision_engine.decide(
+            # 3. LLM 决策（ReAct + Skill 感知）
+            # 首轮传入 Skill 候选，后续轮次仅 tool（已有结果回填）
+            skill_candidates_for_turn = (
+                [s for s in skills_list] if turn == 0 and skills_list else None
+            )
+            decision = decision_engine.decide_with_skills(
                 user_input=user_input,
                 history=self._history,
                 tools=candidate_tools,
                 reflection_hints=hints,
+                skills_candidates=skill_candidates_for_turn,
             )
 
             logger.info(
                 f"决策: action={decision.action}, "
+                f"skill={decision.skill_name}, "
                 f"tools={[t.tool_name for t in decision.tools]}, "
                 f"mode={decision.execution_mode}"
             )
@@ -319,6 +386,20 @@ class UnifiedAgent:
                 answer = decision.direct_response or "（无法生成回答）"
                 self._record_conversation(user_input, answer)
                 return answer
+
+            # 4b. 调用 Skill（ReAct 循环内）→ 通过 SkillExecutor
+            if decision.action == "call_skill" and decision.skill_name:
+                skill = self._skill_registry.get(decision.skill_name) if self._skill_registry else None
+                if skill:
+                    try:
+                        executor = SkillExecutor(mcp_session, step_timeout=self.call_timeout)
+                        answer = await executor.execute(skill, decision.skill_args)
+                        self._record_conversation(user_input, answer)
+                        return answer
+                    except SkillExecutionError as e:
+                        logger.warning(f"ReAct 内 Skill 执行失败: {e}，继续下一轮")
+                        hints.append(f"[本轮已执行] Skill「{decision.skill_name}」→ 失败: {str(e)[:120]}")
+                        continue
 
             # 5. 执行工具调用
             if not decision.tools:
@@ -341,9 +422,24 @@ class UnifiedAgent:
                         latency_ms=r.get("latency_ms", 0),
                     ))
 
-            # 单工具成功 → 直接返回结果（无需再调 final_answer）
-            if len(decision.tools) == 1 and not results[0].get("is_error"):
-                answer = results[0]["result"]
+            # ── 工具结果处理 ──
+            success_count = sum(1 for r in results if not r.get("is_error"))
+            all_failed = success_count == 0
+
+            if not all_failed:
+                # 有至少一个工具成功：统一走 final_answer 汇总
+                # （不再抄近路直接返回原始结果——query_weather 等工具的
+                #  原始输出需要 LLM 加工才能变成用户可读的自然语言）
+                if len(decision.tools) > 1:
+                    logger.info(
+                        f"{success_count}/{len(decision.tools)} 个工具成功，"
+                        f"直接汇总"
+                    )
+                answer = decision_engine.final_answer(
+                    user_input=user_input,
+                    history=self._history,
+                    tool_results=all_results,
+                )
                 self._record_conversation(user_input, answer)
                 return answer
 

@@ -115,7 +115,11 @@ def answer_with_fallback(query: str, top_k: int = TOP_K) -> str:
             merged.append(doc)
     print(f"   📄 合并去重后共 {len(merged)} 个片段", file=sys.stderr)
 
-    # 2. 构建 Prompt 并调用 LLM
+    # 3.5 重排：精排候选片段，提升相关性
+    from reranker import rerank
+    merged = rerank(query, merged)
+
+    # 4. 构建 Prompt 并调用 LLM
     prompt = build_prompt(query, merged)
 
     client = OpenAI(api_key=GROQ_API_KEY, base_url=GROQ_BASE_URL, timeout=30.0)

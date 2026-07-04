@@ -117,6 +117,97 @@ async def check_kb_status() -> str:
 
 
 @mcp.tool()
+async def debug_rerank(query: str, top_k: int = TOP_K) -> str:
+    """
+    调试工具：对比重排前后的检索结果。用于评估重排效果。
+
+    返回：初召回片段数 + 重排后精选片段数 + 排名变化 + 得分。
+    适合在 MCP Inspector 中直观观察重排对检索精度的影响。
+
+    :param query: 搜索关键词（中英文均可）
+    :param top_k: 每次检索返回的片段数量，默认 8
+    """
+    from retriever import _translate_query_for_search
+    from reranker import rerank, _build_rerank_text
+    import os as _os
+
+    # 1. 中文 + 英文双语检索
+    docs_cn = await asyncio.to_thread(search, query, top_k=top_k)
+    docs_en = []
+    try:
+        en_query = await asyncio.to_thread(_translate_query_for_search, query)
+        if en_query:
+            docs_en = await asyncio.to_thread(search, en_query, top_k=top_k)
+    except Exception as e:
+        pass  # 英文检索失败不阻塞
+
+    # 2. 合并去重
+    seen = set()
+    merged = []
+    for doc in docs_cn + docs_en:
+        key = doc.page_content[:120]
+        if key not in seen:
+            seen.add(key)
+            merged.append(doc)
+
+    pre_count = len(merged)
+
+    # 3. 构建初召回预览
+    lines = []
+    lines.append(f"## 🔍 重排调试: {query}")
+    lines.append("")
+    lines.append(f"### 📥 初召回: {pre_count} 个片段")
+    lines.append(f"中文检索: {len(docs_cn)} 条 | 英文检索: {len(docs_en)} 条 | 去重后: {pre_count} 条")
+    lines.append("")
+    lines.append("| # | 来源 | 内容预览 |")
+    lines.append("|---|------|---------|")
+    for i, doc in enumerate(merged[:10], 1):
+        source = _os.path.basename(doc.metadata.get("source", "")) or "未知"
+        preview = doc.page_content[:80].replace("\n", " ").replace("|", "/")
+        lines.append(f"| {i} | {source} | {preview}... |")
+    if pre_count > 10:
+        lines.append(f"| ... | ... | *(共 {pre_count} 条，仅显示前 10)* |")
+
+    # 4. 重排
+    reranked = rerank(query, merged)
+    post_count = len(reranked)
+
+    # 5. 构建重排后预览
+    lines.append("")
+    lines.append(f"### 📤 重排后: {post_count} 个片段")
+    lines.append("")
+    lines.append("| # | 得分 | 排名变化 | 来源 | 内容预览 |")
+    lines.append("|---|------|---------|------|---------|")
+    for i, doc in enumerate(reranked):
+        score = doc.metadata.get("rerank_score", 0)
+        rank = doc.metadata.get("rerank_rank", i + 1)
+        # 计算原始排名
+        try:
+            old_rank = merged.index(doc) + 1
+            if old_rank > rank:
+                change = f"↑{old_rank - rank}"
+            elif old_rank < rank:
+                change = f"↓{rank - old_rank}"
+            else:
+                change = "—"
+        except ValueError:
+            change = "NEW"
+        source = _os.path.basename(doc.metadata.get("source", "")) or "未知"
+        preview = doc.page_content[:80].replace("\n", " ").replace("|", "/")
+        lines.append(f"| {rank} | {score:.2f} | {change} | {source} | {preview}... |")
+
+    # 6. 统计摘要
+    lines.append("")
+    lines.append(f"### 📊 统计")
+    lines.append(f"- 初召回: **{pre_count}** 条")
+    lines.append(f"- 重排后送入 Prompt: **{post_count}** 条")
+    lines.append(f"- 过滤掉: **{pre_count - post_count}** 条" if pre_count > post_count else "- 无过滤（候选数 ≤ 截断上限）")
+    lines.append(f"- 压缩比: **{post_count}/{pre_count}** ({post_count/max(pre_count,1)*100:.0f}%)")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
 async def clear_memory() -> str:
     """清空当前会话的对话记忆，之后的问题将不再有历史上下文。"""
     return "对话记忆已清空。（记忆由智能体统一管理，此操作已通知智能体）"

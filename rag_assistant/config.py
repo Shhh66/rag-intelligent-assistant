@@ -83,6 +83,23 @@ PDF_HEADER_FOOTER_SIMILARITY = 0.8  # 文本相似度 > 80% → 判定为重复
 PDF_TITLE_CLUSTERS = 4            # 预设标题级数（H1-H3 + 正文）
 PDF_TITLE_SIZE_MERGE = 1.0        # 相邻字号差 < 1pt 合并为同一级
 
+# ===== 向量库增量管理配置 =====
+KB_META_FILE = "./chroma_db/db_meta.json"       # 轻量元数据索引文件
+KB_LOCK_FILE = "./chroma_db/kb.lock"            # 全局文件锁路径
+KB_SNAPSHOT_DIR = "./chroma_db/snapshots"       # 操作快照目录
+SNAPSHOT_MAX_COUNT = 10                          # 最多保留快照数
+SOFT_DELETE = False                              # 默认物理删除，True 时标记 is_deleted
+
+# ===== 重排配置 =====
+RERANK_ENABLED = True                       # 是否启用重排
+RERANK_STRATEGY = "cross-encoder"           # "cross-encoder" | "llm" | "none"
+RERANK_TOP_K = 5                            # 重排后送入 Prompt 的片段数（固定条数兜底）
+RERANK_MAX_CANDIDATES = 16                  # 重排候选上限（超过则截断）
+RERANK_MAX_TOKENS = 2000                    # 动态截断：送入 Prompt 的片段总 Token 上限
+RERANK_MIN_SCORE = -999.0                   # 低分过滤阈值（-999=不过滤，设为 -2.0~2.0 启用过滤，BGE logits 通常 -5~5）
+RERANK_MODEL = "BAAI/bge-reranker-v2-m3"    # Cross-Encoder 模型名（多语言，568MB）
+RERANK_CALIBRATION_MAX_RATIO = 1.2          # 双语校准最大补偿倍数（防止过度补偿）
+
 # ===== Markdown 分块配置 =====
 CHUNK_MERGE_RATIO = 1 / 3         # 章节长度 < chunk_size 的 1/3 → 合并到相邻同级章节
 SPLIT_HEADERS = [

@@ -6,7 +6,9 @@ import streamlit as st
 
 from document_loader import load_file, PdfEncryptedError, ScannedPdfError
 from text_splitter import split_documents
-from vector_store import build_vector_store
+from vector_store import (
+    build_vector_store, add_document, list_documents, get_status, remove_document,
+)
 from agent import Agent
 from evaluation import EvaluationLogger
 from token_tracker import get_tracker
@@ -29,9 +31,18 @@ if "logger" not in st.session_state:
 if "history" not in st.session_state:
     st.session_state.history = []
 
-# ===== 侧边栏：文档上传 =====
+# ===== 侧边栏：文档管理 =====
 with st.sidebar:
-    st.header("📄 文档上传")
+    st.header("📄 文档管理")
+
+    # ── 构建模式选择 ──
+    build_mode = st.radio(
+        "构建模式",
+        ["增量添加（追加）", "全量重建（清空旧库）"],
+        help="增量添加：新文档追加到现有知识库，不动已有的；全量重建：清空旧库重新构建",
+    )
+    is_incremental = build_mode.startswith("增量")
+
     uploaded_file = st.file_uploader(
         "上传 PDF / Word / TXT 文件",
         type=["pdf", "docx", "txt"],
@@ -39,50 +50,91 @@ with st.sidebar:
         accept_multiple_files=True,
     )
 
-    if uploaded_file and st.button("🚀 构建知识库", use_container_width=True):
-        all_docs = []
+    if uploaded_file and st.button("🚀 执行", use_container_width=True):
         save_dir = "uploaded_docs"
         os.makedirs(save_dir, exist_ok=True)
 
+        # 保存上传文件
         for uf in uploaded_file:
             file_path = os.path.join(save_dir, uf.name)
             with open(file_path, "wb") as f:
                 f.write(uf.getbuffer())
 
-        with st.spinner("正在处理文档..."):
-            load_errors = []
-            for uf in uploaded_file:
-                file_path = os.path.join(save_dir, uf.name)
-                try:
-                    docs = load_file(file_path)
-                    all_docs.extend(docs)
-                except PdfEncryptedError as e:
-                    load_errors.append(f"🔒 {uf.name}: PDF 已加密，请解密后重新上传")
-                except ScannedPdfError as e:
-                    load_errors.append(f"📷 {uf.name}: 检测为扫描件/图片PDF，建议先用 OCR 工具转换")
-                except Exception as e:
-                    load_errors.append(f"❌ {uf.name}: {e}")
+        if is_incremental:
+            # ── 增量添加 ──
+            with st.spinner("正在增量添加文档..."):
+                results = []
+                for uf in uploaded_file:
+                    file_path = os.path.join(save_dir, uf.name)
+                    result = add_document(file_path, skip_duplicate=True)
+                    results.append((uf.name, result))
 
-            if load_errors:
-                for err in load_errors:
-                    st.warning(err)
-            if all_docs:
-                st.info(f"已加载 {len(all_docs)} 个文档段落")
+                # 汇总结果
+                success_count = 0
+                for name, r in results:
+                    if r.get("skipped"):
+                        st.info(f"⏭ {name}: 已存在（路径+哈希一致），跳过")
+                    elif r.get("error"):
+                        st.warning(f"❌ {name}: {r['error']}")
+                    else:
+                        success_count += 1
+                        st.success(f"✅ {name}: +{r['chunks_added']} chunks")
 
-                chunks = split_documents(all_docs)
-                st.info(f"已切分为 {len(chunks)} 个文本块")
+                if success_count > 0:
+                    st.success(f"🎉 增量添加完成！共 {success_count} 个文档")
+        else:
+            # ── 全量重建 ──
+            with st.spinner("正在处理文档..."):
+                all_docs = []
+                load_errors = []
+                for uf in uploaded_file:
+                    file_path = os.path.join(save_dir, uf.name)
+                    try:
+                        docs = load_file(file_path)
+                        all_docs.extend(docs)
+                    except PdfEncryptedError:
+                        load_errors.append(f"🔒 {uf.name}: PDF 已加密，请解密后重新上传")
+                    except ScannedPdfError:
+                        load_errors.append(f"📷 {uf.name}: 检测为扫描件/图片PDF，建议先用 OCR 工具转换")
+                    except Exception as e:
+                        load_errors.append(f"❌ {uf.name}: {e}")
 
-                build_vector_store(chunks)
-                st.success(f"✅ 知识库构建完成！共 {len(chunks)} 个文本块")
-            elif not load_errors:
-                st.error("未能加载任何文档内容")
+                if load_errors:
+                    for err in load_errors:
+                        st.warning(err)
+                if all_docs:
+                    st.info(f"已加载 {len(all_docs)} 个文档段落")
 
-    # 显示状态
-    db_exists = os.path.exists("chroma_db") and len(os.listdir("chroma_db")) > 0
-    if db_exists:
-        st.success("📊 知识库状态：已就绪")
-    else:
-        st.warning("📊 知识库状态：未构建（请先上传文档）")
+                    chunks = split_documents(all_docs)
+                    st.info(f"已切分为 {len(chunks)} 个文本块")
+
+                    build_vector_store(chunks)
+                    st.success(f"✅ 知识库构建完成！共 {len(chunks)} 个文本块")
+                elif not load_errors:
+                    st.error("未能加载任何文档内容")
+
+    # ── 知识库状态 ──
+    st.divider()
+    st.subheader("📊 知识库状态")
+
+    try:
+        status = get_status()
+        if status["ready"]:
+            st.success(f"就绪 · {status['document_count']} 文档 · {status['total_chunks']} chunks")
+            st.caption(f"模型: {status['embedding_model']} ({status['embedding_dim']}维)")
+
+            # 文档清单
+            with st.expander(f"📋 文档清单（{status['document_count']} 个）"):
+                docs = list_documents()
+                for d in docs:
+                    hash_short = d['file_hash'][:10] + "..." if d['file_hash'] else "(无)"
+                    st.caption(f"• {d['file_path']} — {d['chunks']} chunks")
+                    if d.get('added_at'):
+                        st.caption(f"  _{d['added_at']}_")
+        else:
+            st.warning("未构建（请先上传文档）")
+    except Exception as e:
+        st.warning(f"📊 知识库状态：检查中... ({e})")
 
     # Token 用量展示
     st.divider()

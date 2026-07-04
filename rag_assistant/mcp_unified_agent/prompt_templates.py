@@ -166,6 +166,9 @@ FINAL_ANSWER_SYSTEM = """你是一个智能助手。现在需要基于以下工�
 2. 如果工具调用失败或返回错误，如实告知用户
 3. 如果工具结果不足以完整回答问题，补充你自己的知识，并明确说明哪些来自工具、哪些来自模型自身
 4. 回答要清晰、有条理，必要时使用列表或分段
+5. **重要**：工具结果中可能已包含来源标注（如文件名、页码），你必须在回答中**原样保留**这些出处信息。回答末尾列出参考来源，格式：
+   > 📚 参考来源：
+   > - 文件名，第X页
 
 ## 用户原始问题
 {user_query}
@@ -183,7 +186,7 @@ def build_final_answer_prompt(
     for i, r in enumerate(tool_results, 1):
         tool_name = r.get("tool_name", "未知工具")
         args = r.get("arguments", {})
-        result_text = str(r.get("result", ""))[:600]
+        result_text = str(r.get("result", ""))
         is_error = r.get("is_error", False)
         status = "失败" if is_error else "成功"
 

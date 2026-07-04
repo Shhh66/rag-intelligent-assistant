@@ -298,7 +298,7 @@ class SkillExecutor:
             model=LLM_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.5,
-            max_tokens=800,
+            max_tokens=4000,
         )
 
         get_tracker().record(LLM_MODEL, response.usage, call_site="skill_executor.post_process")
@@ -335,13 +335,15 @@ class SkillExecutor:
             f"2. 如果用户问了生活类问题（如穿什么、带伞等），"
             f"请基于数据给出具体建议\n"
             f"3. 如果用户问了知识类问题，请准确回答\n"
+            f"4. **重要**：工具结果中可能已包含来源标注（如文件名、页码），"
+            f"你必须在回答中**原样保留**这些出处信息，并在末尾列出参考来源\n"
         )
 
         # 如果有关键步骤失败，追加提示
         if critical_failures:
             failed_names = [r["tool_name"] for r in critical_failures]
             prompt += (
-                f"\n4. 注意：以下工具查询失败，请在回答中简要说明："
+                f"\n5. 注意：以下工具查询失败，请在回答中简要说明："
                 f"{', '.join(failed_names)}"
             )
 
@@ -350,7 +352,7 @@ class SkillExecutor:
             model=LLM_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.5,
-            max_tokens=1200,
+            max_tokens=4000,
         )
 
         get_tracker().record(LLM_MODEL, response.usage,

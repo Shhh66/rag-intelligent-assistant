@@ -27,21 +27,35 @@ def _translate_query_for_search(query: str) -> str:
 
 def build_prompt(query: str, retrieved_docs: list) -> str:
     """构建注入检索结果的 Prompt，让 LLM 自主判断检索结果是否相关"""
-    # 拼接检索到的文档片段
+    import os as _os
+
+    # 拼接检索到的文档片段，注入文件名和页码出处
     context_parts = []
     for i, doc in enumerate(retrieved_docs, 1):
-        context_parts.append(f"[参考片段 {i}]\n{doc.page_content}")
+        # 提取文件名（去除路径）
+        source_path = doc.metadata.get('source', '')
+        filename = _os.path.basename(source_path) if source_path else '未知文档'
+        # page_content 已由 text_splitter 注入 [第X页 - Section ...] 前缀
+        context_parts.append(
+            f"[参考片段 {i}] 来源：{filename}\n{doc.page_content}"
+        )
     context = "\n\n".join(context_parts)
 
     prompt = f"""你是一个智能知识库助手。请根据以下参考信息回答用户问题。
 
 ## 重要规则（务必遵守）
-1. 优先基于参考信息回答，在末尾标注来源（如 [参考片段 1][参考片段 2]）
-2. 如果参考信息部分相关，就基于相关部分回答，不清楚的地方如实说
-3. 如果参考信息与用户问题**完全无关**（比如用户问"宇宙是什么"而参考信息全是通信技术文档），请**忽略参考信息，直接用你自己的知识正面回答用户问题**，并在末尾附上：
+1. 优先基于参考信息回答，回答中引用具体数据、事实时要标注出处，格式为：
+   `（来源：文件名，第X页）` 或 `（来源：文件名）`，让读者能快速定位原文。
+   例如："人工智能的定义是……（来源：AI入门.pdf，第3页）"
+2. 在回答末尾，列出本次引用到的所有来源，格式：
+   > 📚 参考来源：
+   > - AI入门.pdf, 第3页
+   > - 机器学习笔记.docx
+3. 如果参考信息部分相关，就基于相关部分回答，不清楚的地方如实说
+4. 如果参考信息与用户问题**完全无关**（比如用户问"宇宙是什么"而参考信息全是通信技术文档），请**忽略参考信息，直接用你自己的知识正面回答用户问题**，并在末尾附上：
    > ⚠️ 本回答并非基于上传的知识库文档，由大模型直接生成。
    **注意：这种情况下，你必须给出实质性的回答内容，绝对不能说"无法回答"或"没有相关信息"。**
-4. 但凡你在回答中引用了任何一个参考片段，就**不要**加第3条的免责声明。
+5. 但凡你在回答中引用了任何一个参考片段，就**不要**加第4条的免责声明。
 
 ## 参考信息
 {context}
@@ -85,7 +99,7 @@ def answer_with_fallback(query: str, top_k: int = TOP_K) -> str:
             model=LLM_MODEL,
             messages=[{"role": "user", "content": query}],
             temperature=0.7,
-            max_tokens=2000,
+            max_tokens=4000,
         )
         answer = response.choices[0].message.content
         get_tracker().record(LLM_MODEL, response.usage, call_site="retriever.direct_answer")
@@ -109,7 +123,7 @@ def answer_with_fallback(query: str, top_k: int = TOP_K) -> str:
         model=LLM_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.3,
-        max_tokens=2000,
+        max_tokens=4000,
     )
 
     answer = response.choices[0].message.content

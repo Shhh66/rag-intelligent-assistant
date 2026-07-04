@@ -4,7 +4,7 @@ import os
 import time
 import streamlit as st
 
-from document_loader import load_file
+from document_loader import load_file, PdfEncryptedError, ScannedPdfError
 from text_splitter import split_documents
 from vector_store import build_vector_store
 from agent import Agent
@@ -50,18 +50,32 @@ with st.sidebar:
                 f.write(uf.getbuffer())
 
         with st.spinner("正在处理文档..."):
+            load_errors = []
             for uf in uploaded_file:
                 file_path = os.path.join(save_dir, uf.name)
-                docs = load_file(file_path)
-                all_docs.extend(docs)
+                try:
+                    docs = load_file(file_path)
+                    all_docs.extend(docs)
+                except PdfEncryptedError as e:
+                    load_errors.append(f"🔒 {uf.name}: PDF 已加密，请解密后重新上传")
+                except ScannedPdfError as e:
+                    load_errors.append(f"📷 {uf.name}: 检测为扫描件/图片PDF，建议先用 OCR 工具转换")
+                except Exception as e:
+                    load_errors.append(f"❌ {uf.name}: {e}")
 
-            st.info(f"已加载 {len(all_docs)} 个文档段落")
+            if load_errors:
+                for err in load_errors:
+                    st.warning(err)
+            if all_docs:
+                st.info(f"已加载 {len(all_docs)} 个文档段落")
 
-            chunks = split_documents(all_docs)
-            st.info(f"已切分为 {len(chunks)} 个文本块")
+                chunks = split_documents(all_docs)
+                st.info(f"已切分为 {len(chunks)} 个文本块")
 
-            build_vector_store(chunks)
-            st.success(f"✅ 知识库构建完成！共 {len(chunks)} 个文本块")
+                build_vector_store(chunks)
+                st.success(f"✅ 知识库构建完成！共 {len(chunks)} 个文本块")
+            elif not load_errors:
+                st.error("未能加载任何文档内容")
 
     # 显示状态
     db_exists = os.path.exists("chroma_db") and len(os.listdir("chroma_db")) > 0

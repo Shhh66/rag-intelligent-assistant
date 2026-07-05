@@ -5,6 +5,37 @@ from openai import OpenAI
 from config import GROQ_API_KEY, GROQ_BASE_URL, LLM_MODEL, TOP_K
 from vector_store import search
 from token_tracker import get_tracker
+import json as _json
+import os as _os
+
+# 权限上下文文件（跨进程共享：app.py 写入 → mcp_server.py 子进程读取）
+# 用绝对路径避免子进程 CWD 不同导致找不到文件
+_KB_PERMISSION_CONTEXT_FILE = _os.path.join(
+    _os.path.dirname(_os.path.abspath(__file__)),
+    "kb_permission_context.json",
+)
+
+
+def set_current_kb_groups(groups: list):
+    """设置当前用户的权限分组（app.py 在每次对话前调用，写入共享文件）"""
+    groups = groups or []
+    with open(_KB_PERMISSION_CONTEXT_FILE, "w", encoding="utf-8") as f:
+        _json.dump(groups, f)
+    print(f"   🔒 权限已写入: {_KB_PERMISSION_CONTEXT_FILE} → {groups}",
+          file=sys.stderr, flush=True)
+
+
+def _get_context_kb_groups():
+    """从共享文件读取权限分组（跨进程兼容）"""
+    try:
+        with open(_KB_PERMISSION_CONTEXT_FILE, "r", encoding="utf-8") as f:
+            groups = _json.load(f)
+            if groups:
+                print(f"   🔒 权限已加载: {groups}", file=sys.stderr, flush=True)
+            return groups if groups else None
+    except Exception as e:
+        print(f"   ⚠️ 读取权限文件失败: {e}", file=sys.stderr, flush=True)
+        return None
 
 
 def _translate_query_for_search(query: str) -> str:
@@ -69,7 +100,10 @@ def build_prompt(query: str, retrieved_docs: list) -> str:
 
 
 def answer_with_fallback(query: str, top_k: int = TOP_K) -> str:
-    """统一入口：双语检索 → 合并去重 → 注入Prompt → LLM自主判断相关性并回答"""
+    """统一入口：双语检索 → 合并去重 → 重排 → 注入Prompt → LLM回答
+
+    权限过滤在 vector_store.search() 底层自动执行（读共享文件），无需显式传参。
+    """
     # 1. 中文 + 英文双语检索，合并去重
     docs_cn, docs_en = [], []
     db_error = False

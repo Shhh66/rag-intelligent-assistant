@@ -100,6 +100,14 @@ RERANK_MIN_SCORE = -999.0                   # 低分过滤阈值（-999=不过�
 RERANK_MODEL = "BAAI/bge-reranker-v2-m3"    # Cross-Encoder 模型名（多语言，568MB）
 RERANK_CALIBRATION_MAX_RATIO = 1.2          # 双语校准最大补偿倍数（防止过度补偿）
 
+# ===== 权限控制配置 =====
+KB_PERMISSION_ENABLED = False                # 是否启用权限过滤（False=全量文档可检索，兼容旧行为）
+KB_DEFAULT_GROUP = "default"                 # 默认知识库分组
+KB_DEFAULT_VISIBILITY = "internal"           # 默认可见性（public|internal|confidential）
+KB_PERMISSION_DB = "./permission.db"         # SQLite 权限数据库路径
+KB_PERMISSION_SECRET_KEY = "rag-kb-secret-change-in-production"  # JWT 签名密钥（生产环境需修改）
+KB_PERMISSION_TOKEN_EXPIRE_HOURS = 24        # JWT Token 过期时间（小时）
+
 # ===== Markdown 分块配置 =====
 CHUNK_MERGE_RATIO = 1 / 3         # 章节长度 < chunk_size 的 1/3 → 合并到相邻同级章节
 SPLIT_HEADERS = [

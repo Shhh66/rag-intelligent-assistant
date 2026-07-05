@@ -12,6 +12,7 @@ from vector_store import (
 from agent import Agent
 from evaluation import EvaluationLogger
 from token_tracker import get_tracker
+from retriever import set_current_kb_groups
 
 # ===== 页面设置 =====
 st.set_page_config(
@@ -112,6 +113,30 @@ with st.sidebar:
                     st.success(f"✅ 知识库构建完成！共 {len(chunks)} 个文本块")
                 elif not load_errors:
                     st.error("未能加载任何文档内容")
+
+    # ── 权限控制（轻量验证版）──
+    st.divider()
+    st.subheader("🔒 权限模拟")
+
+    user = st.selectbox(
+        "当前用户（模拟不同角色）",
+        ["管理员", "工程师", "访客"],
+        help="切换角色模拟权限过滤效果。管理员=不限，工程师=本组+公开，访客=仅公开",
+    )
+
+    ROLE_KB_MAP = {
+        "管理员": None,           # None = 不限权限
+        "工程师": ["dept_rd", "public"],
+        "访客":   ["public"],
+    }
+    kb_groups = ROLE_KB_MAP[user]
+    st.session_state["kb_groups"] = kb_groups
+    set_current_kb_groups(kb_groups)  # 透传给检索层
+
+    if kb_groups:
+        st.caption(f"可访问知识库: {', '.join(kb_groups)}")
+    else:
+        st.caption("可访问知识库: 全部（不限）")
 
     # ── 知识库状态 ──
     st.divider()

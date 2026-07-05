@@ -194,6 +194,25 @@ def cmd_repair(args):
     print(f"   修正 chunk 数量:    {result.get('chunks_fixed', 0)}")
 
 
+def cmd_update_permission(args):
+    """更新文档权限"""
+    from vector_store import update_doc_permission
+
+    result = update_doc_permission(
+        args.file,
+        kb_group=args.kb_group,
+        visibility=args.visibility,
+    )
+    if result.get("error"):
+        print(f"❌ {result['error']}")
+    else:
+        print(f"✅ 权限已更新: {result['file_path']} → {result['updated_chunks']} chunks")
+        if args.kb_group:
+            print(f"   kb_group: {args.kb_group}")
+        if args.visibility:
+            print(f"   visibility: {args.visibility}")
+
+
 def cmd_rollback(args):
     """快照回退"""
     if args.list:
@@ -232,6 +251,7 @@ def main():
   python kb_manager.py clear
   python kb_manager.py migrate
   python kb_manager.py repair
+  python kb_manager.py update-permission "uploaded_docs/文档.pdf" --kb-group dept_rd --visibility internal
   python kb_manager.py rollback --list
   python kb_manager.py rollback 20260704_153000
         """,
@@ -275,6 +295,14 @@ def main():
     # repair
     sub.add_parser("repair", help="双源一致性修复（Chroma ⇔ db_meta.json）")
 
+    # update-permission
+    p_perm = sub.add_parser("update-permission", help="更新文档权限（分组+可见性）")
+    p_perm.add_argument("file", help="文档路径")
+    p_perm.add_argument("--kb-group", help="知识库分组（如 dept_rd）")
+    p_perm.add_argument("--visibility",
+                        choices=["public", "internal", "confidential"],
+                        help="可见性等级")
+
     # rollback
     p_rollback = sub.add_parser("rollback", help="快照回退")
     p_rollback.add_argument("timestamp", nargs="?", help="回退到指定快照（默认最近一次）")
@@ -297,6 +325,7 @@ def main():
         "clear": lambda: cmd_clear(args),
         "migrate": lambda: cmd_migrate(args),
         "repair": lambda: cmd_repair(args),
+        "update-permission": lambda: cmd_update_permission(args),
         "rollback": lambda: cmd_rollback(args),
     }
     commands[args.command]()

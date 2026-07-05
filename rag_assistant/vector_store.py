@@ -146,9 +146,71 @@ def load_vector_store() -> Chroma:
 
 
 def search(query: str, top_k: int = TOP_K):
-    """在向量库中检索与 query 最相似的文档片段"""
+    """在向量库中检索最相似的文档片段（自动读取权限上下文并过滤）"""
+    # 从共享文件读取权限上下文，有则走权限过滤
+    kb_groups = _get_context_kb_groups()
+    if kb_groups:
+        return search_with_permission(query, kb_groups=kb_groups, top_k=top_k)
+
     vector_store = load_vector_store()
     results = vector_store.similarity_search(query, k=top_k)
+    return results
+
+
+# 权限上下文文件
+import json as _json
+import os as _os
+_KB_PERMISSION_CONTEXT_FILE = _os.path.join(
+    _os.path.dirname(_os.path.abspath(__file__)),
+    "kb_permission_context.json",
+)
+
+
+def _get_context_kb_groups():
+    """从共享文件读取权限分组"""
+    try:
+        with open(_KB_PERMISSION_CONTEXT_FILE, "r", encoding="utf-8") as f:
+            groups = _json.load(f)
+            if groups:
+                print(f"   🔒 权限过滤: {groups}", file=sys.stderr, flush=True)
+            return groups if groups else None
+    except Exception:
+        return None
+
+
+def search_with_permission(query: str, kb_groups: list = None,
+                           top_k: int = TOP_K):
+    """带权限过滤的语义检索（全量召回 → 候选集后置 where 过滤）
+
+    kb_groups=None  → 不限权限（管理员，退化为普通 search）
+    kb_groups=[]    → 只能看 public 文档
+    kb_groups=['dept_rd'] → dept_rd 组 + public 文档
+    """
+    if kb_groups is None:
+        return search(query, top_k)
+
+    vector_store = load_vector_store()
+
+    # 构建 where 条件，处理 kb_groups 为空的情况
+    if kb_groups:
+        # 用户可访问的组 + 所有 public 文档
+        where_filter = {
+            "$or": [
+                {"kb_group": {"$in": kb_groups}},
+                {"visibility": "public"},
+            ]
+        }
+    else:
+        # 无分组权限，只能看 public
+        where_filter = {"visibility": "public"}
+
+    print(f"   🔒 权限过滤: kb_groups={kb_groups}, where={where_filter}",
+          file=sys.stderr, flush=True)
+
+    results = vector_store.similarity_search(
+        query, k=top_k,
+        filter=where_filter,
+    )
     return results
 
 
@@ -335,17 +397,25 @@ def list_snapshots() -> list:
 # 增量 CRUD 操作
 # ═══════════════════════════════════════════════════════════════
 
-def add_document(file_path: str, skip_duplicate: bool = True) -> dict:
+def add_document(file_path: str, skip_duplicate: bool = True,
+                 kb_group: str = None, visibility: str = None) -> dict:
     """增量添加单个文档到向量库
 
     安全流程：锁 → 校验模型 → 去重 → 解析切块 → 批量写入 → 回滚异常 → 更新meta → 释放锁
 
     Returns: {"file_path": str, "chunks_added": int, "skipped": bool}
     """
+    from config import KB_DEFAULT_GROUP, KB_DEFAULT_VISIBILITY
+
+    if kb_group is None:
+        kb_group = KB_DEFAULT_GROUP
+    if visibility is None:
+        visibility = KB_DEFAULT_VISIBILITY
+
     lock = _get_lock()
     try:
         lock.acquire()
-        return _add_document_locked(file_path, skip_duplicate)
+        return _add_document_locked(file_path, skip_duplicate, kb_group, visibility)
     except LockTimeout:
         return {"file_path": _normalize_path(file_path), "chunks_added": 0, "skipped": False,
                 "error": "知识库正在操作中，请稍后再试"}
@@ -356,7 +426,8 @@ def add_document(file_path: str, skip_duplicate: bool = True) -> dict:
             pass
 
 
-def _add_document_locked(file_path: str, skip_duplicate: bool) -> dict:
+def _add_document_locked(file_path: str, skip_duplicate: bool,
+                          kb_group: str, visibility: str) -> dict:
     """持有锁的执行体"""
     # 延迟导入，避免循环依赖
     from document_loader import load_file, PdfEncryptedError, ScannedPdfError
@@ -408,16 +479,20 @@ def _add_document_locked(file_path: str, skip_duplicate: bool) -> dict:
         doc.metadata["file_path"] = rel_path
         doc.metadata["file_hash"] = file_hash
         doc.metadata["added_at"] = now
+        doc.metadata["kb_group"] = kb_group
+        doc.metadata["visibility"] = visibility
 
     chunks = split_documents(docs)
     if not chunks:
         return {"file_path": rel_path, "chunks_added": 0, "skipped": False,
                 "error": "文档分块后无内容"}
 
-    # 注入 metadata 到每个 chunk
+    # 注入 metadata 到每个 chunk（含权限字段）
     for chunk in chunks:
         chunk.metadata["file_path"] = rel_path
         chunk.metadata["file_hash"] = file_hash
+        chunk.metadata["kb_group"] = kb_group
+        chunk.metadata["visibility"] = visibility
         if "added_at" not in chunk.metadata:
             chunk.metadata["added_at"] = now
 
@@ -581,10 +656,19 @@ def _update_document_locked(abs_path: str, rel_path: str, new_hash: str, old_has
                 "error": "检测为扫描件/图片PDF，建议先用 OCR 工具转换"}
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    # 保留旧权限（如果有），否则用默认值
+    old_kb_group = (meta_stored.get("kb_group") if 'meta_stored' in dir()
+                    else KB_DEFAULT_GROUP)
+    from config import KB_DEFAULT_GROUP, KB_DEFAULT_VISIBILITY
+    kb_group = KB_DEFAULT_GROUP
+    visibility = KB_DEFAULT_VISIBILITY
+
     for doc in docs:
         doc.metadata["file_path"] = rel_path
         doc.metadata["file_hash"] = new_hash
         doc.metadata["added_at"] = now
+        doc.metadata["kb_group"] = kb_group
+        doc.metadata["visibility"] = visibility
 
     chunks = split_documents(docs)
     if not chunks:
@@ -594,6 +678,8 @@ def _update_document_locked(abs_path: str, rel_path: str, new_hash: str, old_has
     for chunk in chunks:
         chunk.metadata["file_path"] = rel_path
         chunk.metadata["file_hash"] = new_hash
+        chunk.metadata["kb_group"] = kb_group
+        chunk.metadata["visibility"] = visibility
         if "added_at" not in chunk.metadata:
             chunk.metadata["added_at"] = now
 
@@ -821,6 +907,47 @@ def migrate() -> dict:
               file=sys.stderr, flush=True)
 
     return {"migrated_chunks": len(updated_ids), "documents_found": len(seen_sources)}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 权限管理
+# ═══════════════════════════════════════════════════════════════
+
+def update_doc_permission(file_path: str, kb_group: str = None,
+                          visibility: str = None) -> dict:
+    """批量更新某文档所有 chunk 的权限元数据
+
+    适用场景：文档移动分组、修改可见性等级。
+    注意：ChromaDB 的 col.update() 不支持回滚，异常场景通过 repair 校准。
+
+    Returns: {"file_path": str, "updated_chunks": int, "error": str|None}
+    """
+    client = chromadb.PersistentClient(path=VECTOR_DB_PATH)
+    try:
+        col = client.get_collection("langchain")
+    except Exception:
+        return {"file_path": file_path, "updated_chunks": 0,
+                "error": "向量库集合不存在"}
+
+    results = col.get(where={"file_path": file_path})
+    ids = results['ids']
+    if not ids:
+        return {"file_path": file_path, "updated_chunks": 0,
+                "error": "未找到该文档的 chunk"}
+
+    metadatas = []
+    for meta in results['metadatas']:
+        if kb_group:
+            meta['kb_group'] = kb_group
+        if visibility:
+            meta['visibility'] = visibility
+        metadatas.append(meta)
+
+    col.update(ids=ids, metadatas=metadatas)
+    print(f"   🔒 权限更新: {file_path} → {len(ids)} chunks "
+          f"(kb_group={kb_group}, visibility={visibility})",
+          file=sys.stderr, flush=True)
+    return {"file_path": file_path, "updated_chunks": len(ids)}
 
 
 # ═══════════════════════════════════════════════════════════════

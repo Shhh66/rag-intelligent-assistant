@@ -11,6 +11,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.security import HTTPBearer
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import jwt
 
@@ -20,6 +21,16 @@ from config import (
 )
 
 app = FastAPI(title="RAG 权限管理 API")
+
+# CORS：允许前端 localhost:5173 跨域访问
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 security = HTTPBearer()
 
 
@@ -90,7 +101,7 @@ def init_db():
         conn.execute(
             "INSERT INTO roles (name, permissions) VALUES (?, ?)",
             ("管理员", json.dumps(["upload", "delete_doc", "search_all",
-                                   "manage_users", "view_audit", "export"])),
+                                   "manage_users", "manage_kb", "view_audit", "export"])),
         )
         conn.execute(
             "INSERT INTO roles (name, permissions) VALUES (?, ?)",
@@ -99,6 +110,20 @@ def init_db():
         conn.execute(
             "INSERT INTO roles (name, permissions) VALUES (?, ?)",
             ("访客", json.dumps(["search_group"])),
+        )
+        conn.commit()
+
+    # 初始化默认管理员
+    existing_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    if existing_users == 0:
+        pwd = hashlib.sha256("admin123".encode()).hexdigest()
+        conn.execute(
+            "INSERT INTO users (username, password_hash, department) VALUES (?, ?, ?)",
+            ("admin", pwd, "技术部"),
+        )
+        # 分配管理员角色
+        conn.execute(
+            "INSERT INTO user_roles (user_id, role_id) VALUES (1, 1)"
         )
         conn.commit()
 
@@ -141,6 +166,11 @@ class KbGroupCreate(BaseModel):
 
 class KbGroupUpdate(BaseModel):
     name: str = None
+    visibility: str = None
+
+
+class DocPermUpdate(BaseModel):
+    kb_group: str = None
     visibility: str = None
 
 
@@ -215,6 +245,10 @@ def login(req: LoginRequest):
     for r in roles:
         permissions.update(json.loads(r["permissions"]))
 
+    # 无角色 → 默认访客权限
+    if not permissions:
+        permissions = {"search_group"}
+
     groups = conn.execute(
         """SELECT kg.name FROM kb_groups kg
            JOIN kb_group_members gm ON kg.id = gm.group_id
@@ -222,10 +256,13 @@ def login(req: LoginRequest):
     ).fetchall()
     kb_groups = [g["name"] for g in groups]
 
-    # 管理员可访问全部分组
+    # 管理员 → None 表示不限权限（不做任何过滤）
     if "search_all" in permissions:
-        all_groups = conn.execute("SELECT name FROM kb_groups").fetchall()
-        kb_groups = [g["name"] for g in all_groups]
+        kb_groups = None  # None = search() 走无过滤路径
+
+    # 非管理员且无分组 → 至少能看到公开文档
+    if kb_groups is not None and not kb_groups:
+        kb_groups = ["public"]
 
     conn.close()
 
@@ -277,14 +314,67 @@ def create_user(req: UserCreate, user=Depends(require_permission("manage_users")
     return {"status": "ok", "username": req.username}
 
 
+# ── 角色管理 ──
+
+@app.get("/api/roles")
+def list_roles(user=Depends(get_current_user)):
+    conn = _get_db()
+    rows = conn.execute("SELECT * FROM roles").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 # ── 知识库分组 ──
 
 @app.get("/api/kb/groups")
 def list_kb_groups(user=Depends(get_current_user)):
     conn = _get_db()
     rows = conn.execute("SELECT * FROM kb_groups").fetchall()
+    result = []
+    for r in rows:
+        d = dict(r)
+        # 成员数
+        mc = conn.execute(
+            "SELECT COUNT(*) FROM kb_group_members WHERE group_id = ?", (r["id"],)
+        ).fetchone()[0]
+        d["member_count"] = mc
+        # 文档数：从 db_meta.json 读取（ChromaDB 索引）
+        d["doc_count"] = 0
+        result.append(d)
     conn.close()
-    return [dict(r) for r in rows]
+
+    # 从 db_meta.json 获取每个分组的文档数
+    try:
+        from vector_store import _load_meta
+        meta = _load_meta()
+        for d in result:
+            count = sum(
+                1 for fp, info in meta.get("documents", {}).items()
+                if info.get("kb_group") == d["name"]
+            )
+            d["doc_count"] = count if count else d["doc_count"]
+    except Exception:
+        pass
+
+    # ChromaDB 兜底：db_meta.json 没有权限信息的旧文档，从向量库直接统计
+    try:
+        import chromadb
+        from config import VECTOR_DB_PATH
+        client = chromadb.PersistentClient(path=VECTOR_DB_PATH)
+        col = client.get_collection("langchain")
+        for d in result:
+            if d["doc_count"] == 0:
+                data = col.get(where={"kb_group": d["name"]})
+                if data["ids"]:
+                    unique_files = set(
+                        m.get("file_path") or m.get("source", "")
+                        for m in data["metadatas"]
+                    )
+                    d["doc_count"] = len(unique_files)
+    except Exception:
+        pass
+
+    return result
 
 
 @app.post("/api/kb/groups")
@@ -298,6 +388,58 @@ def create_kb_group(req: KbGroupCreate,
     conn.commit()
     conn.close()
     return {"status": "ok", "name": req.name}
+
+
+@app.get("/api/kb/groups/{group_id}/members")
+def list_group_members(group_id: int, user=Depends(get_current_user)):
+    """获取分组成员列表"""
+    conn = _get_db()
+    members = conn.execute(
+        "SELECT u.id, u.username FROM users u "
+        "JOIN kb_group_members gm ON u.id = gm.user_id "
+        "WHERE gm.group_id = ?", (group_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(m) for m in members]
+
+
+@app.put("/api/kb/groups/{group_id}/members")
+def manage_group_members(group_id: int, member_ids: list[int] = None,
+                          action: str = "list",
+                          user=Depends(get_current_user)):
+    """管理分组成员：action=list|add|remove"""
+    conn = _get_db()
+    existing = conn.execute("SELECT * FROM kb_groups WHERE id = ?", (group_id,)).fetchone()
+    if not existing:
+        conn.close()
+        raise HTTPException(404, f"分组不存在: {group_id}")
+
+    if action == "list":
+        members = conn.execute(
+            "SELECT u.id, u.username FROM users u "
+            "JOIN kb_group_members gm ON u.id = gm.user_id "
+            "WHERE gm.group_id = ?", (group_id,),
+        ).fetchall()
+        conn.close()
+        return [dict(m) for m in members]
+
+    if action == "add" and member_ids:
+        for uid in member_ids:
+            conn.execute(
+                "INSERT OR IGNORE INTO kb_group_members (group_id, user_id) VALUES (?, ?)",
+                (group_id, uid),
+            )
+        conn.commit()
+    elif action == "remove" and member_ids:
+        for uid in member_ids:
+            conn.execute(
+                "DELETE FROM kb_group_members WHERE group_id = ? AND user_id = ?",
+                (group_id, uid),
+            )
+        conn.commit()
+
+    conn.close()
+    return {"status": "ok"}
 
 
 @app.put("/api/kb/groups/{group_id}")
@@ -329,6 +471,208 @@ def update_kb_group(group_id: int, req: KbGroupUpdate,
     conn.commit()
     conn.close()
     return {"status": "ok", "group_id": group_id}
+
+
+# ── 用户编辑/删除 ──
+
+@app.put("/api/users/{user_id}")
+def update_user(user_id: int, req: UserUpdate,
+                user=Depends(require_permission("manage_users"))):
+    conn = _get_db()
+    existing = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not existing:
+        conn.close()
+        raise HTTPException(404, f"用户不存在: {user_id}")
+    if req.username:
+        conn.execute("UPDATE users SET username = ? WHERE id = ?", (req.username, user_id))
+    if req.department is not None:
+        conn.execute("UPDATE users SET department = ? WHERE id = ?", (req.department, user_id))
+    if req.is_active is not None:
+        conn.execute("UPDATE users SET is_active = ? WHERE id = ?", (int(req.is_active), user_id))
+    conn.commit()
+    conn.close()
+    return {"status": "ok", "user_id": user_id}
+
+
+@app.delete("/api/users/{user_id}")
+def delete_user(user_id: int, user=Depends(require_permission("manage_users"))):
+    if user_id == 1:
+        raise HTTPException(403, "不能删除默认管理员")
+    conn = _get_db()
+    conn.execute("DELETE FROM user_roles WHERE user_id = ?", (user_id,))
+    conn.execute("DELETE FROM kb_group_members WHERE user_id = ?", (user_id,))
+    conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "ok", "user_id": user_id}
+
+
+# ── 用户分组管理 ──
+
+@app.get("/api/users/{user_id}/groups")
+def get_user_groups(user_id: int, user=Depends(require_permission("manage_users"))):
+    """获取用户所属的知识库分组"""
+    conn = _get_db()
+    rows = conn.execute(
+        "SELECT kg.id, kg.name FROM kb_groups kg "
+        "JOIN kb_group_members gm ON kg.id = gm.group_id "
+        "WHERE gm.user_id = ?", (user_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+@app.put("/api/users/{user_id}/groups")
+def set_user_groups(user_id: int, group_ids: list[int],
+                     user=Depends(require_permission("manage_users"))):
+    """设置用户的知识库分组（全量替换）"""
+    conn = _get_db()
+    conn.execute("DELETE FROM kb_group_members WHERE user_id = ?", (user_id,))
+    for gid in group_ids:
+        conn.execute(
+            "INSERT OR IGNORE INTO kb_group_members (group_id, user_id) VALUES (?, ?)",
+            (gid, user_id),
+        )
+    conn.commit()
+    conn.close()
+    return {"status": "ok", "user_id": user_id, "group_ids": group_ids}
+
+
+# ── 角色 CRUD ──
+
+@app.post("/api/roles")
+def create_role(user=Depends(require_permission("manage_users"))):
+    conn = _get_db()
+    conn.execute("INSERT INTO roles (name, permissions) VALUES (?, '[]')", ("新角色",))
+    conn.commit()
+    role_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.close()
+    return {"status": "ok", "id": role_id, "name": "新角色"}
+
+
+@app.put("/api/roles/{role_id}")
+def update_role(role_id: int, req: RoleUpdate,
+                user=Depends(require_permission("manage_users"))):
+    if role_id <= 3:
+        raise HTTPException(403, "默认角色不可编辑，请创建新角色")
+    conn = _get_db()
+    if req.permissions is not None:
+        conn.execute("UPDATE roles SET permissions = ? WHERE id = ?",
+                     (json.dumps(req.permissions), role_id))
+    conn.commit()
+    conn.close()
+    return {"status": "ok", "role_id": role_id}
+
+
+@app.delete("/api/roles/{role_id}")
+def delete_role(role_id: int, user=Depends(require_permission("manage_users"))):
+    if role_id <= 3:
+        raise HTTPException(403, "默认角色不可删除")
+    conn = _get_db()
+    conn.execute("DELETE FROM user_roles WHERE role_id = ?", (role_id,))
+    conn.execute("DELETE FROM roles WHERE id = ?", (role_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "ok", "role_id": role_id}
+
+
+# ── 知识库分组删除 ──
+
+@app.delete("/api/kb/groups/{group_id}")
+def delete_kb_group(group_id: int, user=Depends(require_permission("manage_kb"))):
+    conn = _get_db()
+    conn.execute("DELETE FROM kb_group_members WHERE group_id = ?", (group_id,))
+    conn.execute("DELETE FROM kb_groups WHERE id = ?", (group_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "ok", "group_id": group_id}
+
+
+# ── 文档管理（对接 kb_manager.py）──
+
+@app.get("/api/kb/documents")
+def list_documents(user=Depends(get_current_user)):
+    """获取知识库文档列表（含权限信息）"""
+    try:
+        from vector_store import list_documents as list_docs
+        docs = list_docs()
+
+        # 补充权限信息（从 ChromaDB 读取每个文档的 kb_group + visibility）
+        try:
+            import os, chromadb
+            from config import VECTOR_DB_PATH
+            client = chromadb.PersistentClient(path=VECTOR_DB_PATH)
+            col = client.get_collection("langchain")
+            for doc in docs:
+                fp = doc.get("file_path", "")
+                sample = None
+                # 优先按 file_path 查
+                if fp:
+                    sample = col.get(where={"file_path": fp}, limit=1)
+                # 没匹配 → 兜底按 source（纯文件名）查（兼容老数据 file_path 为空的情况）
+                if not sample or not sample["metadatas"]:
+                    basename = os.path.basename(fp) if fp else ""
+                    if basename:
+                        sample = col.get(where={"source": basename}, limit=1)
+                if sample and sample["metadatas"]:
+                    doc["kb_group"] = sample["metadatas"][0].get("kb_group", "")
+                    doc["visibility"] = sample["metadatas"][0].get("visibility", "")
+        except Exception:
+            pass
+
+        return docs
+    except Exception as e:
+        return {"error": str(e), "hint": "请确保知识库已构建"}
+
+
+@app.put("/api/kb/documents/{filename:path}/permission")
+def update_doc_perm(filename: str, body: DocPermUpdate,
+                     user=Depends(require_permission("manage_kb"))):
+    """更新文档权限分组"""
+    try:
+        from vector_store import update_doc_permission
+        result = update_doc_permission(filename, kb_group=body.kb_group, visibility=body.visibility)
+        if result.get("error"):
+            raise HTTPException(400, result["error"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.delete("/api/kb/documents/{filename:path}")
+def delete_document(filename: str, user=Depends(require_permission("delete_doc"))):
+    """删除文档"""
+    try:
+        from vector_store import remove_document
+        result = remove_document(filename)
+        return result
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+# ── 审计日志 ──
+
+@app.get("/api/kb/audit")
+def list_audit_logs(limit: int = 50, user=Depends(require_permission("view_audit"))):
+    conn = _get_db()
+    rows = conn.execute(
+        "SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT ?", (limit,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# ── Token 刷新 ──
+
+@app.post("/api/auth/refresh")
+def refresh_token(user=Depends(get_current_user)):
+    new_token = _create_token(
+        user["user_id"], user["username"],
+        user.get("permissions", []), user.get("kb_groups", []),
+    )
+    return {"token": new_token}
 
 
 # ═══════════════════════════════════════════════════════════════

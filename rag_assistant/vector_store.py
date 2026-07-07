@@ -323,15 +323,95 @@ def _backup_snapshot(operation: str) -> str:
     except Exception:
         pass  # 集合不存在时跳过
 
-    # 清理超出数量的旧快照
+    # 清理超出数量的旧快照（连带 chunk 备份一起清）
     snapshots = sorted(snapshot_dir.glob("snapshot_*.json"), reverse=True)
     for old in snapshots[SNAPSHOT_MAX_COUNT:]:
+        ts = old.stem.replace("snapshot_", "")
         old.unlink()
-        old_bak = snapshot_dir / old.name.replace("snapshot_", "db_meta.").replace(".json", ".bak")
-        if old_bak.exists():
-            old_bak.unlink()
+        for prefix in ["db_meta.", "chunks_"]:
+            old_file = snapshot_dir / f"{prefix}{ts}.bak" if prefix == "db_meta." else snapshot_dir / f"{prefix}{ts}.json"
+            # Also try without .bak suffix for db_meta
+            if not old_file.exists() and prefix == "db_meta.":
+                old_file = snapshot_dir / f"{prefix}{ts}"
+            if old_file.exists():
+                old_file.unlink()
 
     return timestamp
+
+
+def _backup_chunks(operation: str, col_get_result: dict,
+                   timestamp: str = None) -> str:
+    """删除操作前备份即将被删的 chunk 数据（精准备份，不拷全库）
+
+    保存 ChromaDB col.get() 返回的完整数据，回退时可精确恢复。
+    timestamp 应与 _backup_snapshot() 返回值一致，保证回退时能匹配。
+    Returns: 备份文件名（不含扩展名），如 "chunks_20260705_143000"
+    """
+    if not col_get_result or not col_get_result.get("ids"):
+        return ""
+
+    if timestamp is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    snapshot_dir = Path(KB_SNAPSHOT_DIR)
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+    backup_data = {
+        "operation": operation,
+        "timestamp": timestamp,
+        "ids": col_get_result["ids"],
+        "documents": col_get_result.get("documents", []),
+        "metadatas": col_get_result.get("metadatas", []),
+        "embeddings": col_get_result.get("embeddings"),  # 可能为 None（get 时未 include）
+    }
+    backup_path = snapshot_dir / f"chunks_{timestamp}.json"
+    with open(backup_path, "w", encoding="utf-8") as f:
+        json.dump(backup_data, f, ensure_ascii=False)
+
+    print(f"   💾 已备份 {len(backup_data['ids'])} 个 chunk → {backup_path.name}",
+          file=sys.stderr, flush=True)
+    return f"chunks_{timestamp}"
+
+
+def _restore_chunks(backup_name: str) -> int:
+    """从备份文件恢复 chunk 到 ChromaDB
+
+    Returns: 恢复的 chunk 数量，-1 表示失败
+    """
+    snapshot_dir = Path(KB_SNAPSHOT_DIR)
+    backup_path = snapshot_dir / f"{backup_name}.json"
+    if not backup_path.exists():
+        return -1
+
+    with open(backup_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    ids = data.get("ids", [])
+    if not ids:
+        return 0
+
+    client = chromadb.PersistentClient(path=VECTOR_DB_PATH)
+    try:
+        col = client.get_collection("langchain")
+    except Exception:
+        col = client.create_collection("langchain")
+
+    # 先清除可能残留的同 ID chunk（幂等）
+    try:
+        col.delete(ids=ids)
+    except Exception:
+        pass
+
+    # 写入备份数据
+    col.add(
+        ids=ids,
+        documents=data.get("documents"),
+        metadatas=data.get("metadatas"),
+        embeddings=data.get("embeddings"),
+    )
+    print(f"   ♻ 已恢复 {len(ids)} 个 chunk: {backup_name}",
+          file=sys.stderr, flush=True)
+    return len(ids)
 
 
 def rollback(timestamp: str = None) -> dict:
@@ -361,19 +441,47 @@ def rollback(timestamp: str = None) -> dict:
     with open(target, "r", encoding="utf-8") as f:
         snapshot = json.load(f)
 
+    # 查找对应的 chunk 备份
+    chunk_backups = sorted(
+        snapshot_dir.glob(f"chunks_{timestamp}*.json") or
+        snapshot_dir.glob("chunks_*.json"),
+        reverse=True,
+    )
+    # 优先精确匹配时间戳，否则取最近一次
+    exact_chunk = snapshot_dir / f"chunks_{timestamp}.json"
+    if exact_chunk.exists():
+        chunk_backup_name = f"chunks_{timestamp}"
+    elif chunk_backups:
+        # 取不晚于目标快照的最近一次 chunk 备份
+        recent = [c for c in chunk_backups
+                  if c.stem.replace("chunks_", "") <= timestamp]
+        chunk_backup_name = recent[0].stem if recent else (
+            chunk_backups[0].stem if chunk_backups else ""
+        )
+    else:
+        chunk_backup_name = ""
+
     # 恢复 db_meta.json
     bak_path = snapshot_dir / snapshot.get("db_meta_backup", "")
-    if bak_path.exists():
-        shutil.copy2(bak_path, _get_meta_path())
-        meta = _load_meta()
-        doc_count = len(meta.get("documents", {}))
-        return {
-            "restored_documents": doc_count,
-            "timestamp": timestamp,
-            "note": f"已恢复到 {timestamp} 的快照状态。注意：向量库中的 chunk 无法回退（ChromaDB 不支持），建议用 kb_manager.py repair 校验一致性。",
-        }
-    else:
+    if not bak_path.exists():
         return {"restored_documents": 0, "note": "快照备份文件缺失"}
+
+    shutil.copy2(bak_path, _get_meta_path())
+    meta = _load_meta()
+    doc_count = len(meta.get("documents", {}))
+
+    # 恢复 chunk 数据
+    chunks_restored = 0
+    if chunk_backup_name:
+        chunks_restored = _restore_chunks(chunk_backup_name)
+
+    return {
+        "restored_documents": doc_count,
+        "chunks_restored": chunks_restored,
+        "timestamp": timestamp,
+        "note": f"已恢复到 {timestamp} 的快照状态。"
+                + (f" 恢复了 {chunks_restored} 个 chunk。" if chunks_restored else ""),
+    }
 
 
 def list_snapshots() -> list:
@@ -540,6 +648,8 @@ def _add_document_locked(file_path: str, skip_duplicate: bool,
         "chunks": len(chunks),
         "added_at": old_doc.get("added_at", now),
         "updated_at": now if old_doc else None,
+        "kb_group": kb_group,
+        "visibility": visibility,
     }
     meta["total_chunks"] = sum(d["chunks"] for d in meta["documents"].values())
     _save_meta(meta)
@@ -571,8 +681,8 @@ def _remove_document_locked(file_path: str) -> dict:
     """持有锁的删除执行体"""
     rel_path = _normalize_path(file_path)
 
-    # 快照备份
-    _backup_snapshot(f"remove: {rel_path}")
+    # 快照备份（db_meta.json + 快照索引）
+    snapshot_ts = _backup_snapshot(f"remove: {rel_path}")
 
     client = chromadb.PersistentClient(path=VECTOR_DB_PATH)
     try:
@@ -592,6 +702,8 @@ def _remove_document_locked(file_path: str) -> dict:
 
     ids = results['ids']
     if ids:
+        # 删前精准备份：只备份即将被删的 chunk（共用快照时间戳保证回退可匹配）
+        _backup_chunks(f"remove: {rel_path}", results, snapshot_ts)
         col.delete(ids=ids)
         print(f"   🗑 已删除 {len(ids)} 个 chunk: {rel_path}", file=sys.stderr, flush=True)
 
@@ -639,8 +751,8 @@ def _update_document_locked(abs_path: str, rel_path: str, new_hash: str, old_has
     from document_loader import load_file, PdfEncryptedError, ScannedPdfError
     from text_splitter import split_documents
 
-    # 快照备份
-    _backup_snapshot(f"update: {rel_path}")
+    # 快照备份（共用时间戳，保证回退时 chunk 备份可匹配）
+    snapshot_ts = _backup_snapshot(f"update: {rel_path}")
 
     # 1. 解析新版本 chunks
     try:
@@ -656,12 +768,12 @@ def _update_document_locked(abs_path: str, rel_path: str, new_hash: str, old_has
                 "error": "检测为扫描件/图片PDF，建议先用 OCR 工具转换"}
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-    # 保留旧权限（如果有），否则用默认值
-    old_kb_group = (meta_stored.get("kb_group") if 'meta_stored' in dir()
-                    else KB_DEFAULT_GROUP)
+    # 保留旧权限（从 db_meta.json 读取），否则用默认值
     from config import KB_DEFAULT_GROUP, KB_DEFAULT_VISIBILITY
-    kb_group = KB_DEFAULT_GROUP
-    visibility = KB_DEFAULT_VISIBILITY
+    meta_before = _load_meta()
+    old_doc_meta = meta_before.get("documents", {}).get(rel_path, {})
+    kb_group = old_doc_meta.get("kb_group", KB_DEFAULT_GROUP)
+    visibility = old_doc_meta.get("visibility", KB_DEFAULT_VISIBILITY)
 
     for doc in docs:
         doc.metadata["file_path"] = rel_path
@@ -712,13 +824,17 @@ def _update_document_locked(abs_path: str, rel_path: str, new_hash: str, old_has
         return {"file_path": rel_path, "chunks_removed": 0, "chunks_added": 0,
                 "error": f"新版本写入失败，旧版本数据保留: {e}"}
 
-    # 3. 写入成功 → 删除旧版本 chunks
+    # 3. 写入成功 → 备份并删除旧版本 chunks
     chunks_removed = 0
     if old_hash:
-        old_ids = col.get(where={"file_path": rel_path})
-        # 过滤掉新写入的 ID
-        old_ids_to_delete = [id_ for id_ in old_ids['ids'] if id_ not in chunk_ids]
+        old_results = col.get(
+            where={"file_path": rel_path},
+            include=["documents", "metadatas", "embeddings"],
+        )
+        old_ids_to_delete = [id_ for id_ in old_results['ids'] if id_ not in chunk_ids]
         if old_ids_to_delete:
+            # 精准备份旧版本数据（共用快照时间戳）
+            _backup_chunks(f"update: {rel_path}", old_results, snapshot_ts)
             col.delete(ids=old_ids_to_delete)
             chunks_removed = len(old_ids_to_delete)
 
@@ -730,6 +846,8 @@ def _update_document_locked(abs_path: str, rel_path: str, new_hash: str, old_has
         "chunks": len(chunks),
         "added_at": old_doc.get("added_at", now),
         "updated_at": now,
+        "kb_group": kb_group,
+        "visibility": visibility,
     }
     meta["total_chunks"] = sum(d["chunks"] for d in meta["documents"].values())
     _save_meta(meta)
@@ -750,6 +868,8 @@ def list_documents() -> list:
             "file_hash": info.get("file_hash", ""),
             "added_at": info.get("added_at", ""),
             "updated_at": info.get("updated_at"),
+            "kb_group": info.get("kb_group", ""),
+            "visibility": info.get("visibility", ""),
         }
         for path, info in docs.items()
     ]
@@ -929,7 +1049,14 @@ def update_doc_permission(file_path: str, kb_group: str = None,
         return {"file_path": file_path, "updated_chunks": 0,
                 "error": "向量库集合不存在"}
 
+    # 优先按 file_path 匹配
     results = col.get(where={"file_path": file_path})
+
+    # 没匹配到 → 兜底按 source（纯文件名）匹配（兼容未 migrate 的老数据）
+    if not results['ids']:
+        basename = os.path.basename(file_path)
+        results = col.get(where={"source": basename})
+
     ids = results['ids']
     if not ids:
         return {"file_path": file_path, "updated_chunks": 0,
@@ -937,9 +1064,9 @@ def update_doc_permission(file_path: str, kb_group: str = None,
 
     metadatas = []
     for meta in results['metadatas']:
-        if kb_group:
+        if kb_group is not None:
             meta['kb_group'] = kb_group
-        if visibility:
+        if visibility is not None:
             meta['visibility'] = visibility
         metadatas.append(meta)
 
@@ -947,6 +1074,17 @@ def update_doc_permission(file_path: str, kb_group: str = None,
     print(f"   🔒 权限更新: {file_path} → {len(ids)} chunks "
           f"(kb_group={kb_group}, visibility={visibility})",
           file=sys.stderr, flush=True)
+
+    # 同步更新 db_meta.json（用于分组页文档计数）
+    rel_path = _normalize_path(file_path)
+    meta = _load_meta()
+    if rel_path in meta.get("documents", {}):
+        if kb_group is not None:
+            meta["documents"][rel_path]["kb_group"] = kb_group
+        if visibility is not None:
+            meta["documents"][rel_path]["visibility"] = visibility
+        _save_meta(meta)
+
     return {"file_path": file_path, "updated_chunks": len(ids)}
 
 

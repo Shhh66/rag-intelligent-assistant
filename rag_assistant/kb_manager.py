@@ -154,6 +154,11 @@ def cmd_clear(args):
 
     client = chromadb.PersistentClient(path=VECTOR_DB_PATH)
     try:
+        col = client.get_collection("langchain")
+        # 清空前备份全部 chunk 数据
+        from vector_store import _backup_chunks
+        all_data = col.get(include=["documents", "metadatas", "embeddings"])
+        _backup_chunks("clear", all_data)
         client.delete_collection("langchain")
         print("🗑 已清空向量库")
     except Exception:
@@ -211,6 +216,73 @@ def cmd_update_permission(args):
             print(f"   kb_group: {args.kb_group}")
         if args.visibility:
             print(f"   visibility: {args.visibility}")
+
+
+def cmd_repair_permission(args):
+    """校验并修复 ChromaDB 权限元数据一致性"""
+    import chromadb
+    from config import VECTOR_DB_PATH
+
+    client = chromadb.PersistentClient(path=VECTOR_DB_PATH)
+    try:
+        col = client.get_collection("langchain")
+        all_data = col.get()
+    except Exception:
+        print("❌ 向量库集合不存在")
+        return
+
+    from collections import defaultdict
+    issues = []
+    fixed = 0
+
+    # 扫描所有 chunk 的权限字段
+    missing = defaultdict(int)
+    for meta in all_data.get("metadatas", []):
+        fp = meta.get("file_path", meta.get("source", "unknown"))
+        if "kb_group" not in meta:
+            missing[fp] += 1
+            issues.append(f"  - {fp}: 缺少 kb_group ({missing[fp]} chunks)")
+        if "visibility" not in meta:
+            missing[fp] += 1
+            issues.append(f"  - {fp}: 缺少 visibility")
+
+    if not issues:
+        print("✅ 权限元数据一致: 所有 chunk 均含 kb_group + visibility 字段")
+        return
+
+    print(f"⚠️ 发现 {len(issues)} 处不一致:\n")
+    for issue in issues[:20]:
+        print(issue)
+
+    if args.fix:
+        # 补全默认值
+        from config import KB_DEFAULT_GROUP, KB_DEFAULT_VISIBILITY
+        updated = []
+        new_metadatas = []
+        for meta in all_data.get("metadatas", []):
+            changed = False
+            if "kb_group" not in meta:
+                meta["kb_group"] = KB_DEFAULT_GROUP
+                changed = True
+            if "visibility" not in meta:
+                meta["visibility"] = KB_DEFAULT_VISIBILITY
+                changed = True
+            if changed:
+                updated.append(meta)
+                new_metadatas.append(meta)
+        if updated:
+            # batch update
+            updated_ids = [all_data["ids"][i] for i, m in enumerate(all_data["metadatas"])
+                          if "kb_group" not in m or "visibility" not in m]
+            if updated_ids:
+                col.update(ids=updated_ids, metadatas=[
+                    {**m, "kb_group": m.get("kb_group", KB_DEFAULT_GROUP),
+                     "visibility": m.get("visibility", KB_DEFAULT_VISIBILITY)}
+                    for m in all_data["metadatas"]
+                    if "kb_group" not in m or "visibility" not in m
+                ])
+                fixed = len(updated_ids)
+                print(f"\n✅ 已修复: {fixed} chunks 已补全默认权限")
 
 
 def cmd_rollback(args):
@@ -300,8 +372,12 @@ def main():
     p_perm.add_argument("file", help="文档路径")
     p_perm.add_argument("--kb-group", help="知识库分组（如 dept_rd）")
     p_perm.add_argument("--visibility",
-                        choices=["public", "internal", "confidential"],
+                        choices=["public", "internal"],
                         help="可见性等级")
+
+    # repair-permission
+    p_rp = sub.add_parser("repair-permission", help="校验并修复权限元数据一致性")
+    p_rp.add_argument("--fix", action="store_true", help="自动补全缺失的权限字段")
 
     # rollback
     p_rollback = sub.add_parser("rollback", help="快照回退")
@@ -326,6 +402,7 @@ def main():
         "migrate": lambda: cmd_migrate(args),
         "repair": lambda: cmd_repair(args),
         "update-permission": lambda: cmd_update_permission(args),
+        "repair-permission": lambda: cmd_repair_permission(args),
         "rollback": lambda: cmd_rollback(args),
     }
     commands[args.command]()

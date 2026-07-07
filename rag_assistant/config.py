@@ -41,7 +41,7 @@ TOP_K = 8                          # 每次检索返回 8 个最相关片段（�
 # ===== MCP 统一智能体配置 =====
 MCP_MAX_TURNS = 5                  # 最大工具调用轮次（防死循环）
 MCP_TOOL_TOP_N = 5                 # 向量预筛选工具的 Top-N 数量
-MCP_CALL_TIMEOUT = 60.0            # 单次工具调用超时（秒）
+MCP_CALL_TIMEOUT = 180.0           # 单次工具调用超时（秒），首次查询含模型加载+检索+翻译+重排+LLM
 MCP_REFLECTION_MAX = 50            # 反思记忆最大条数
 MCP_HEARTBEAT_INTERVAL = 30.0      # MCP 心跳间隔（秒）
 
@@ -103,7 +103,7 @@ RERANK_CALIBRATION_MAX_RATIO = 1.2          # 双语校准最大补偿倍数（�
 # ===== 权限控制配置 =====
 KB_PERMISSION_ENABLED = False                # 是否启用权限过滤（False=全量文档可检索，兼容旧行为）
 KB_DEFAULT_GROUP = "default"                 # 默认知识库分组
-KB_DEFAULT_VISIBILITY = "internal"           # 默认可见性（public|internal|confidential）
+KB_DEFAULT_VISIBILITY = "internal"           # 默认可见性（public | internal）
 KB_PERMISSION_DB = "./permission.db"         # SQLite 权限数据库路径
 KB_PERMISSION_SECRET_KEY = "rag-kb-secret-change-in-production"  # JWT 签名密钥（生产环境需修改）
 KB_PERMISSION_TOKEN_EXPIRE_HOURS = 24        # JWT Token 过期时间（小时）

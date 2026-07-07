@@ -12,6 +12,7 @@ from vector_store import (
 from agent import Agent
 from evaluation import EvaluationLogger
 from token_tracker import get_tracker
+import requests as _requests
 from retriever import set_current_kb_groups
 
 # ===== 页面设置 =====
@@ -51,6 +52,16 @@ with st.sidebar:
         accept_multiple_files=True,
     )
 
+    if uploaded_file:
+        # ── 上传参数：知识库分组 + 可见性 ──
+        col1, col2 = st.columns(2)
+        with col1:
+            kb_group = st.text_input("知识库分组", value="default",
+                                     help="文档归属的知识库分组（如 dept_rd）")
+        with col2:
+            visibility = st.selectbox("可见性", ["internal", "public"],
+                                      help="public=全员可见, internal=仅本组可见")
+
     if uploaded_file and st.button("🚀 执行", use_container_width=True):
         save_dir = "uploaded_docs"
         os.makedirs(save_dir, exist_ok=True)
@@ -67,7 +78,8 @@ with st.sidebar:
                 results = []
                 for uf in uploaded_file:
                     file_path = os.path.join(save_dir, uf.name)
-                    result = add_document(file_path, skip_duplicate=True)
+                    result = add_document(file_path, skip_duplicate=True,
+                                        kb_group=kb_group, visibility=visibility)
                     results.append((uf.name, result))
 
                 # 汇总结果
@@ -114,29 +126,51 @@ with st.sidebar:
                 elif not load_errors:
                     st.error("未能加载任何文档内容")
 
-    # ── 权限控制（轻量验证版）──
+    # ── 权限控制（实用落地版：账号密码登录）──
     st.divider()
-    st.subheader("🔒 权限模拟")
+    st.subheader("🔒 账户")
 
-    user = st.selectbox(
-        "当前用户（模拟不同角色）",
-        ["管理员", "工程师", "访客"],
-        help="切换角色模拟权限过滤效果。管理员=不限，工程师=本组+公开，访客=仅公开",
-    )
-
-    ROLE_KB_MAP = {
-        "管理员": None,           # None = 不限权限
-        "工程师": ["dept_rd", "public"],
-        "访客":   ["public"],
-    }
-    kb_groups = ROLE_KB_MAP[user]
-    st.session_state["kb_groups"] = kb_groups
-    set_current_kb_groups(kb_groups)  # 透传给检索层
-
-    if kb_groups:
-        st.caption(f"可访问知识库: {', '.join(kb_groups)}")
+    if "auth_token" not in st.session_state:
+        # 未登录 → 登录表单
+        username = st.text_input("用户名", key="login_user")
+        password = st.text_input("密码", type="password", key="login_pass")
+        if st.button("🚀 登录", use_container_width=True):
+            try:
+                resp = _requests.post(
+                    "http://localhost:8000/api/auth/login",
+                    json={"username": username, "password": password},
+                    timeout=5,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    st.session_state["auth_token"] = data["token"]
+                    st.session_state["auth_user"] = data["user"]
+                    kb_groups = data["user"].get("kb_groups", [])
+                    if not kb_groups:
+                        kb_groups = None
+                    set_current_kb_groups(kb_groups)
+                    st.rerun()
+                else:
+                    st.error(f"登录失败: {resp.json().get('detail', '未知错误')}")
+            except Exception as e:
+                st.warning(f"无法连接权限服务: {e}")
     else:
-        st.caption("可访问知识库: 全部（不限）")
+        # 已登录 → 用户信息
+        user = st.session_state["auth_user"]
+        st.success(f"👤 {user['username']}")
+        perms = user.get("permissions", [])
+        if perms:
+            st.caption(f"权限: {', '.join(perms)}")
+        kb = user.get("kb_groups", [])
+        if kb:
+            st.caption(f"可访问知识库: {', '.join(kb)}")
+        else:
+            st.caption("可访问知识库: 全部（管理员）")
+        if st.button("🚪 退出登录", use_container_width=True):
+            for k in ["auth_token", "auth_user"]:
+                st.session_state.pop(k, None)
+            set_current_kb_groups(None)
+            st.rerun()
 
     # ── 知识库状态 ──
     st.divider()

@@ -167,3 +167,78 @@ def answer_with_fallback(query: str, top_k: int = TOP_K) -> str:
     answer = response.choices[0].message.content
     get_tracker().record(LLM_MODEL, response.usage, call_site="retriever.rag_answer")
     return answer
+
+
+def retrieve_and_answer(
+    query: str,
+    top_k: int = TOP_K,
+    use_bilingual: bool = True,
+    use_rerank: bool = True,
+) -> tuple[str, list[str]]:
+    """评测专用入口：检索 → (可选双语/重排) → 生成，同时返回答案与上下文。
+
+    与 answer_with_fallback 的区别：额外返回 contexts（RAGAS 评测强制需要），
+    并用两个开关控制 A/B 对比：
+      - use_bilingual=False, use_rerank=False → Baseline（纯向量单路）
+      - use_bilingual=True,  use_rerank=True  → Optimized（双语 + BGE 重排）
+
+    复用现有 search() / _translate_query_for_search() / rerank() / build_prompt()，
+    不重写检索逻辑。
+
+    Returns:
+        (answer, contexts)：answer 为 LLM 回答字符串；
+        contexts 为送入 Prompt 的片段文本列表（检索不到时为空列表）。
+    """
+    # 1. 中文检索（始终执行）
+    docs_cn, docs_en = [], []
+    try:
+        print(f"   🔍 中文检索: {query[:40]}...", file=sys.stderr)
+        docs_cn = search(query, top_k=top_k)
+        print(f"      找到 {len(docs_cn)} 个片段", file=sys.stderr)
+    except Exception as e:
+        print(f"   ⚠️ 检索失败: {e}", file=sys.stderr)
+        return f"检索失败: {e}", []
+
+    # 2. 英文检索（可选，A/B 开关）
+    if use_bilingual:
+        try:
+            en_query = _translate_query_for_search(query)
+            if en_query and en_query.strip():
+                print(f"   🔍 英文检索: {en_query}", file=sys.stderr)
+                docs_en = search(en_query, top_k=top_k)
+                print(f"      找到 {len(docs_en)} 个片段", file=sys.stderr)
+            else:
+                print(f"   ⏭️ 翻译为空，跳过英文检索", file=sys.stderr)
+        except Exception as e:
+            print(f"   ⚠️ 英文检索失败: {e}", file=sys.stderr)
+
+    # 3. 合并去重
+    seen = set()
+    merged = []
+    for doc in docs_cn + docs_en:
+        key = doc.page_content[:120]
+        if key not in seen:
+            seen.add(key)
+            merged.append(doc)
+
+    if not merged:
+        return "知识库中未检索到相关内容。", []
+
+    # 4. 重排（可选，A/B 开关）
+    if use_rerank:
+        from reranker import rerank
+        merged = rerank(query, merged)
+
+    # 5. 构建 Prompt 并调用 LLM
+    contexts = [doc.page_content for doc in merged]
+    prompt = build_prompt(query, merged)
+    client = OpenAI(api_key=GROQ_API_KEY, base_url=GROQ_BASE_URL, timeout=60.0)
+    response = client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3,
+        max_tokens=4000,
+    )
+    answer = response.choices[0].message.content
+    get_tracker().record(LLM_MODEL, response.usage, call_site="retriever.eval_answer")
+    return answer, contexts

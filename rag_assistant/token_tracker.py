@@ -126,6 +126,19 @@ class TokenTracker:
         # 实时持久化到文件
         self._persist_record(record)
 
+        # 上报 LangFuse generation（降级安全，复用当前 trace_id）
+        try:
+            from observability import obs_generation
+            obs_generation(
+                trace_id=getattr(self, "_current_trace_id", ""),
+                name=call_site or "llm",
+                model=model,
+                usage=usage,
+                metadata={"call_site": call_site, "cost_rmb": cost},
+            )
+        except Exception:
+            pass
+
         logger.debug(
             f"Token 记录 [{call_site}]: {model} "
             f"in={prompt_tokens} out={completion_tokens} ¥{cost:.6f}"
@@ -160,6 +173,10 @@ class TokenTracker:
             "total_cost": self._total_cost,
             "call_count": len(self._calls),
         }
+
+    def set_trace_id(self, trace_id: str):
+        """设置当前对话的 trace_id，供 record() 上报 LangFuse generation 归并链路。"""
+        self._current_trace_id = trace_id
 
     def get_conversation_diff(self) -> dict:
         """获取当前对话的增量统计（自上次 start_conversation 后）。

@@ -157,6 +157,11 @@ class UnifiedAgent:
         # 标记新一轮对话开始（不重置历史数据）
         get_tracker().start_conversation()
 
+        # 生成本次对话的 trace_id：贯穿工具审计与 LangFuse 可观测，一次打通两边
+        import uuid
+        trace_id = uuid.uuid4().hex
+        get_tracker().set_trace_id(trace_id)
+
         params = StdioServerParameters(
             command=self.server_command,
             args=self.server_args,
@@ -192,7 +197,7 @@ class UnifiedAgent:
 
                 # 3. 执行流水线
                 decision_engine = DecisionEngine(self._llm_client, self.model)
-                scheduler = Scheduler(mcp, tool_registry, self.call_timeout)
+                scheduler = Scheduler(mcp, tool_registry, self.call_timeout, trace_id=trace_id)
 
                 answer = await self._pipeline(
                     user_input=user_input,
@@ -211,6 +216,12 @@ class UnifiedAgent:
                     f"(in={summary['total_input']:,}, out={summary['total_output']:,}) | "
                     f"费用: ¥{summary['total_cost']:.6f}"
                 )
+                # flush LangFuse 上报（降级安全）
+                try:
+                    from observability import flush_obs
+                    flush_obs()
+                except Exception:
+                    pass
                 return answer
 
     async def _warm_up(self, mcp_client: MCPSession) -> None:
@@ -308,6 +319,7 @@ class UnifiedAgent:
                             executor = SkillExecutor(
                                 mcp_session,
                                 step_timeout=self.call_timeout,
+                                trace_id=scheduler.trace_id,
                             )
                             answer = await executor.execute(
                                 skill, skill_result.args
@@ -392,7 +404,7 @@ class UnifiedAgent:
                 skill = self._skill_registry.get(decision.skill_name) if self._skill_registry else None
                 if skill:
                     try:
-                        executor = SkillExecutor(mcp_session, step_timeout=self.call_timeout)
+                        executor = SkillExecutor(mcp_session, step_timeout=self.call_timeout, trace_id=scheduler.trace_id)
                         answer = await executor.execute(skill, decision.skill_args)
                         self._record_conversation(user_input, answer)
                         return answer

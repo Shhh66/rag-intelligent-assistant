@@ -33,10 +33,12 @@ class Scheduler:
         mcp_client: MCPSession,
         registry: ToolRegistry,
         default_timeout: float = 60.0,
+        trace_id: str = "",
     ):
         self.mcp_client = mcp_client
         self.registry = registry
         self.default_timeout = default_timeout
+        self.trace_id = trace_id
 
     async def execute(
         self,
@@ -86,18 +88,19 @@ class Scheduler:
         """执行单个工具调用：
 
         1. registry.validate(name, args) -- 参数校验
-        2. mcp_client.call_tool(name, args) -- MCP 调用
+        2. mcp_client.call_tool(name, args) -- MCP 调用（自带超时+重试退避）
         3. 从 CallToolResult 中提取文本内容
-        4. 记录耗时和错误状态
+        4. 记录耗时和错误状态 + 结构化审计(trace_id)
         """
         start = time.time()
 
-        # 1. 参数校验
+        # 1. 参数校验（失败不重试、不计入工具审计的重试）
         valid, error_msg = self.registry.validate(
             decision.tool_name, decision.arguments
         )
         if not valid:
             latency = (time.time() - start) * 1000
+            self._audit(decision, "", False, latency, error=f"参数校验失败: {error_msg}")
             return {
                 "tool_name": decision.tool_name,
                 "arguments": decision.arguments,
@@ -106,13 +109,11 @@ class Scheduler:
                 "latency_ms": round(latency, 2),
             }
 
-        # 2. MCP 调用
+        # 2. MCP 调用（call_tool 内部已含 asyncio.wait_for 超时 + tenacity 退避重试，
+        #    故此处不再套外层 wait_for，避免掐断重试）
         try:
-            result = await asyncio.wait_for(
-                self.mcp_client.call_tool(
-                    decision.tool_name, decision.arguments
-                ),
-                timeout=self.default_timeout,
+            result = await self.mcp_client.call_tool(
+                decision.tool_name, decision.arguments
             )
 
             # 3. 提取文本内容
@@ -124,6 +125,8 @@ class Scheduler:
                 f"工具 {decision.tool_name} 执行完成 "
                 f"({'失败' if is_error else '成功'}, {latency:.0f}ms)"
             )
+            self._audit(decision, text, not is_error, latency,
+                        error=(text[:200] if is_error else ""))
 
             return {
                 "tool_name": decision.tool_name,
@@ -133,9 +136,11 @@ class Scheduler:
                 "latency_ms": round(latency, 2),
             }
 
-        except asyncio.TimeoutError:
+        except ToolCallTimeoutError:
             latency = (time.time() - start) * 1000
             logger.warning(f"工具 {decision.tool_name} 调用超时")
+            self._audit(decision, "", False, latency,
+                        error=f"工具调用超时(重试后仍失败)")
             return {
                 "tool_name": decision.tool_name,
                 "arguments": decision.arguments,
@@ -147,6 +152,8 @@ class Scheduler:
         except Exception as e:
             latency = (time.time() - start) * 1000
             logger.error(f"工具 {decision.tool_name} 执行异常: {e}")
+            self._audit(decision, "", False, latency,
+                        error=f"{type(e).__name__}: {e}")
             return {
                 "tool_name": decision.tool_name,
                 "arguments": decision.arguments,
@@ -154,6 +161,38 @@ class Scheduler:
                 "is_error": True,
                 "latency_ms": round(latency, 2),
             }
+
+    # ── 审计 ──────────────────────────────────────────────────
+
+    def _audit(self, decision, result_preview, success, latency_ms, error=""):
+        """写一条工具调用审计（失败静默，不阻断）+ LangFuse span。"""
+        try:
+            from tool_audit import log_tool_call
+            log_tool_call(
+                trace_id=self.trace_id,
+                tool_name=decision.tool_name,
+                arguments=decision.arguments,
+                result_preview=result_preview,
+                latency_ms=latency_ms,
+                success=success,
+                error=error,
+            )
+        except Exception:
+            pass
+        # LangFuse span（降级安全）
+        try:
+            from observability import obs_span
+            with obs_span(
+                f"工具:{decision.tool_name}",
+                trace_id=self.trace_id,
+                metadata={"success": success, "latency_ms": round(latency_ms, 2),
+                          "error": error[:120] if error else ""},
+                level="ERROR" if not success else "DEFAULT",
+                input=decision.arguments,
+            ):
+                pass
+        except Exception:
+            pass
 
     # ── 结果提取 ──────────────────────────────────────────────
 

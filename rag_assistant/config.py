@@ -165,3 +165,22 @@ QUERY_REWRITE_MULTI_N = 3                 # multi 模式生成的 query 数
 QUERY_REWRITE_MAX_TOKENS = 512            # 改写输出上限（deepseek-v4-flash 是推理模型，需给 reasoning 留足空间，否则 content 为空）
 QUERY_REWRITE_CACHE_SIZE = 100            # 改写结果 LRU 缓存条数（0=关闭）
 QUERY_REWRITE_COREF_ROUNDS = 3            # 指代消解引用的最近对话轮次
+
+# ===== MCP 工具调用统一重试（tenacity 指数退避）=====
+TOOL_RETRY_ENABLED = True                 # 工具调用重试总开关
+TOOL_RETRY_MAX = 3                        # 最大尝试次数（含首次）
+TOOL_RETRY_BACKOFF_BASE = 0.5             # 指数退避基数（秒）
+TOOL_RETRY_MAX_WAIT = 8.0                 # 单次最大等待（秒）
+
+# ===== 工具调用审计（结构化落盘 + trace_id）=====
+TOOL_AUDIT_ENABLED = True                 # 审计开关
+TOOL_AUDIT_PATH = "./tool_audit.jsonl"    # 审计日志文件（实时追加）
+TOOL_AUDIT_ARG_MAXLEN = 500               # 单个入参值截断长度（脱敏+防膨胀）
+TOOL_AUDIT_SENSITIVE_KEYS = ["api_key", "secret", "token", "password"]  # 掩码字段
+
+# ===== 可观测性（LangFuse 自托管）=====
+LANGFUSE_ENABLED = False                  # 总开关（默认关，需先起 LangFuse 服务再开）
+# 密钥走 .env：LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_HOST
+LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY", "")
+LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY", "")
+LANGFUSE_HOST = os.getenv("LANGFUSE_HOST", "http://localhost:3000")

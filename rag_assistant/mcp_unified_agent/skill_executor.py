@@ -38,11 +38,13 @@ class SkillExecutor:
         step_timeout: float = DEFAULT_STEP_TIMEOUT,
         skill_timeout: float = DEFAULT_SKILL_TIMEOUT,
         depth: int = 0,
+        trace_id: str = "",
     ):
         self.mcp = mcp_session
         self.step_timeout = step_timeout
         self.skill_timeout = skill_timeout
         self.depth = depth
+        self.trace_id = trace_id
         self._logs: list[dict] = []
 
     # ── 主入口 ────────────────────────────────────────────────
@@ -200,6 +202,7 @@ class SkillExecutor:
 
                 self._log("step", f"步骤 {index}: {tool_name} 成功 ({latency:.0f}ms)",
                           {"tool": tool_name, "latency_ms": latency, "attempt": attempt + 1})
+                self._audit(tool_name, filled_args, text, True, latency, attempt)
 
                 return {
                     "tool_name": tool_name,
@@ -362,6 +365,7 @@ class SkillExecutor:
     # ── 工具方法 ──────────────────────────────────────────────
 
     def _error_result(self, tool: str, args: dict, critical: bool, msg: str) -> dict:
+        self._audit(tool, args, "", False, 0.0, 0, error=msg)
         return {
             "tool_name": tool,
             "arguments": args,
@@ -370,6 +374,23 @@ class SkillExecutor:
             "latency_ms": 0,
             "critical": critical,
         }
+
+    def _audit(self, tool, args, result_preview, success, latency_ms, attempt, error=""):
+        """写工具调用审计（Skill 路径，失败静默不阻断）。"""
+        try:
+            from tool_audit import log_tool_call
+            log_tool_call(
+                trace_id=self.trace_id,
+                tool_name=tool,
+                arguments=args,
+                result_preview=result_preview,
+                latency_ms=latency_ms,
+                success=success,
+                retry_count=max(0, attempt),
+                error=error,
+            )
+        except Exception:
+            pass
 
     def _extract_text(self, result) -> str:
         """从 CallToolResult.content 中提取文本。"""

@@ -2,11 +2,25 @@
 
 import sys
 from openai import OpenAI
-from config import GROQ_API_KEY, GROQ_BASE_URL, LLM_MODEL, TOP_K
+from config import GROQ_API_KEY, GROQ_BASE_URL, LLM_MODEL, TOP_K, HYBRID_ENABLED
 from vector_store import search
 from token_tracker import get_tracker
 import json as _json
 import os as _os
+
+
+def _search(query: str, top_k: int = TOP_K):
+    """检索入口：HYBRID_ENABLED 时走混合检索(BM25+向量+RRF)，否则纯向量。
+
+    混合检索模块任何异常都降级回纯向量 search()，绝不阻断主链路。
+    """
+    if HYBRID_ENABLED:
+        try:
+            from hybrid_retriever import hybrid_search
+            return hybrid_search(query, top_k=top_k)
+        except Exception as e:
+            print(f"   ⚠️ 混合检索降级纯向量: {e}", file=sys.stderr)
+    return search(query, top_k=top_k)
 
 # 权限上下文文件（跨进程共享：app.py 写入 → mcp_server.py 子进程读取）
 # 用绝对路径避免子进程 CWD 不同导致找不到文件
@@ -39,7 +53,11 @@ def _get_context_kb_groups():
 
 
 def _translate_query_for_search(query: str) -> str:
-    """将中文查询翻译为英文关键词，提升英文文档检索命中率"""
+    """将中文查询翻译为英文关键词，提升英文文档检索命中率。
+
+    注意：LLM_MODEL(deepseek-v4-flash) 是推理模型，会先输出 reasoning_content，
+    max_tokens 过小会导致正式 content 为空。故给足 512 token 空间。
+    """
     client = OpenAI(api_key=GROQ_API_KEY, base_url=GROQ_BASE_URL, timeout=30.0)
     resp = client.chat.completions.create(
         model=LLM_MODEL,
@@ -48,7 +66,7 @@ def _translate_query_for_search(query: str) -> str:
             "content": f"将以下中文问题翻译为适合英文文档检索的英文关键词（5-10个词即可）：\n\n{query}\n\n只输出英文关键词，不要解释。"
         }],
         temperature=0,
-        max_tokens=50,
+        max_tokens=512,
     )
     en_keywords = resp.choices[0].message.content.strip()
     get_tracker().record(LLM_MODEL, resp.usage, call_site="retriever.translate_query")
@@ -99,18 +117,30 @@ def build_prompt(query: str, retrieved_docs: list) -> str:
 
 
 
-def answer_with_fallback(query: str, top_k: int = TOP_K) -> str:
-    """统一入口：双语检索 → 合并去重 → 重排 → 注入Prompt → LLM回答
+def answer_with_fallback(query: str, top_k: int = TOP_K, history: list = None) -> str:
+    """统一入口：查询改写 → 混合检索(双语) → 合并去重 → 重排 → 注入Prompt → LLM回答
 
     权限过滤在 vector_store.search() 底层自动执行（读共享文件），无需显式传参。
+    query 改写与混合检索均由 config 开关控制，失败自动降级。
     """
-    # 1. 中文 + 英文双语检索，合并去重
+    # 0. 查询改写（clarify：规范化+指代消解），失败无感回退原 query
+    search_query = query
+    try:
+        from query_rewriter import rewrite_query
+        rewritten = rewrite_query(query, history=history, mode="clarify")
+        if isinstance(rewritten, str) and rewritten.strip():
+            search_query = rewritten
+    except Exception as e:
+        print(f"   ⚠️ 查询改写跳过: {e}", file=sys.stderr)
+
+    # 检索用改写后的 query；原 query 仍用于重排与 Prompt（保留用户真实意图）
+    # 1. 中文 + 英文双语检索（混合检索：BM25+向量），合并去重
     docs_cn, docs_en = [], []
     db_error = False
 
     try:
-        print(f"   🔍 中文检索: {query[:40]}...", file=sys.stderr)
-        docs_cn = search(query, top_k=top_k)
+        print(f"   🔍 中文检索: {search_query[:40]}...", file=sys.stderr)
+        docs_cn = _search(search_query, top_k=top_k)
         print(f"      找到 {len(docs_cn)} 个片段", file=sys.stderr)
     except Exception as e:
         db_error = True
@@ -118,10 +148,11 @@ def answer_with_fallback(query: str, top_k: int = TOP_K) -> str:
 
     if not db_error:
         try:
-            en_query = _translate_query_for_search(query)
-            print(f"   🔍 英文检索: {en_query}", file=sys.stderr)
-            docs_en = search(en_query, top_k=top_k)
-            print(f"      找到 {len(docs_en)} 个片段", file=sys.stderr)
+            en_query = _translate_query_for_search(search_query)
+            if en_query and en_query.strip():
+                print(f"   🔍 英文检索: {en_query}", file=sys.stderr)
+                docs_en = _search(en_query, top_k=top_k)
+                print(f"      找到 {len(docs_en)} 个片段", file=sys.stderr)
         except Exception as e:
             print(f"   ⚠️ 英文检索失败: {e}", file=sys.stderr)
 
@@ -174,26 +205,46 @@ def retrieve_and_answer(
     top_k: int = TOP_K,
     use_bilingual: bool = True,
     use_rerank: bool = True,
+    use_hybrid: bool = False,
+    use_rewrite: bool = False,
 ) -> tuple[str, list[str]]:
-    """评测专用入口：检索 → (可选双语/重排) → 生成，同时返回答案与上下文。
+    """评测专用入口：检索 → (可选双语/混合/改写/重排) → 生成，返回答案与上下文。
 
     与 answer_with_fallback 的区别：额外返回 contexts（RAGAS 评测强制需要），
-    并用两个开关控制 A/B 对比：
-      - use_bilingual=False, use_rerank=False → Baseline（纯向量单路）
-      - use_bilingual=True,  use_rerank=True  → Optimized（双语 + BGE 重排）
-
-    复用现有 search() / _translate_query_for_search() / rerank() / build_prompt()，
-    不重写检索逻辑。
+    并用开关控制 A/B 对比：
+      - Baseline  ：use_bilingual=F, use_rerank=F, use_hybrid=F, use_rewrite=F（纯向量单路）
+      - Optimized ：use_bilingual=T, use_rerank=T（双语 + BGE 重排）
+      - use_hybrid=T ：检索走混合(BM25+向量+RRF)，可单独评估混合检索增益
+      - use_rewrite=T：检索前做 query 改写(clarify)，可单独评估改写增益
 
     Returns:
-        (answer, contexts)：answer 为 LLM 回答字符串；
-        contexts 为送入 Prompt 的片段文本列表（检索不到时为空列表）。
+        (answer, contexts)：contexts 为送入 Prompt 的片段文本列表（检索不到时为空列表）。
     """
+    # 检索用 query（可选改写）；原 query 用于重排与 Prompt
+    search_query = query
+    if use_rewrite:
+        try:
+            from query_rewriter import rewrite_query
+            r = rewrite_query(query, mode="clarify")
+            if isinstance(r, str) and r.strip():
+                search_query = r
+        except Exception as e:
+            print(f"   ⚠️ 改写跳过: {e}", file=sys.stderr)
+
+    def _do_search(q, k):
+        if use_hybrid:
+            try:
+                from hybrid_retriever import hybrid_search
+                return hybrid_search(q, top_k=k)
+            except Exception as e:
+                print(f"   ⚠️ 混合检索降级: {e}", file=sys.stderr)
+        return search(q, top_k=k)
+
     # 1. 中文检索（始终执行）
     docs_cn, docs_en = [], []
     try:
-        print(f"   🔍 中文检索: {query[:40]}...", file=sys.stderr)
-        docs_cn = search(query, top_k=top_k)
+        print(f"   🔍 中文检索: {search_query[:40]}...", file=sys.stderr)
+        docs_cn = _do_search(search_query, top_k)
         print(f"      找到 {len(docs_cn)} 个片段", file=sys.stderr)
     except Exception as e:
         print(f"   ⚠️ 检索失败: {e}", file=sys.stderr)
@@ -202,10 +253,10 @@ def retrieve_and_answer(
     # 2. 英文检索（可选，A/B 开关）
     if use_bilingual:
         try:
-            en_query = _translate_query_for_search(query)
+            en_query = _translate_query_for_search(search_query)
             if en_query and en_query.strip():
                 print(f"   🔍 英文检索: {en_query}", file=sys.stderr)
-                docs_en = search(en_query, top_k=top_k)
+                docs_en = _do_search(en_query, top_k)
                 print(f"      找到 {len(docs_en)} 个片段", file=sys.stderr)
             else:
                 print(f"   ⏭️ 翻译为空，跳过英文检索", file=sys.stderr)

@@ -43,8 +43,11 @@ BASELINE_PATH = os.path.join(_THIS_DIR, "baseline.json")
 
 # A/B 两组配置
 CONFIGS = {
-    "baseline":  {"use_bilingual": False, "use_rerank": False, "label": "Baseline(纯向量)"},
-    "optimized": {"use_bilingual": True,  "use_rerank": True,  "label": "Optimized(双语+重排)"},
+    "baseline":  {"use_bilingual": False, "use_rerank": False,
+                  "use_hybrid": False, "use_rewrite": False, "label": "Baseline(纯向量)"},
+    "optimized": {"use_bilingual": True,  "use_rerank": True,
+                  "use_hybrid": True,  "use_rewrite": True,
+                  "label": "Optimized(改写+混合检索+双语+重排)"},
 }
 
 # 指标中文名 + 是否越低越好
@@ -126,6 +129,8 @@ def collect_samples(testset, cfg):
                 q,
                 use_bilingual=cfg["use_bilingual"],
                 use_rerank=cfg["use_rerank"],
+                use_hybrid=cfg.get("use_hybrid", False),
+                use_rewrite=cfg.get("use_rewrite", False),
             )
         except Exception as e:
             print(f"      ⚠️ 生成失败: {e}", file=sys.stderr)
@@ -160,11 +165,15 @@ def run_ragas(samples):
     )
 
     dataset = EvaluationDataset(samples=samples)
+    # DeepSeek 端点在高并发下易超时，调大单请求超时、降低并发，避免 Job 超时污染均值(NaN)
+    from ragas.run_config import RunConfig
+    run_config = RunConfig(timeout=180, max_workers=4, max_retries=3)
     result = evaluate(
         dataset=dataset,
         metrics=[context_recall, context_precision, faithfulness, answer_relevancy],
         llm=get_ragas_llm(),
         embeddings=get_ragas_embeddings(),
+        run_config=run_config,
     )
     return result.to_pandas()
 

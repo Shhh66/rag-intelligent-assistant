@@ -4,6 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 始终使用中文回复。
 
+## 环境约定（重要）
+
+**本项目安装的所有依赖都必须安装在 D 盘，禁止占用 C 盘。**
+- Python 依赖装入 D 盘的项目 venv：`d:\VsCode\AI\rag_assistant\venv`（`pip install` 前先激活它）。
+- pip 下载缓存与临时解压目录指向 D 盘：`PIP_CACHE_DIR=D:\VsCode\AI\.cache\pip`、`TMPDIR/TEMP/TMP=D:\VsCode\AI\.cache\tmp`（或 `pip install --cache-dir D:\VsCode\AI\.cache\pip`）。
+- HuggingFace / 模型缓存指向 D 盘：设置 `HF_HOME`（如 `D:\VsCode\AI\.cache\huggingface`），避免模型下载到 C 盘用户目录。
+- 安装任何新依赖前确认目标路径在 D 盘，安装后核对未在 C 盘新增占用。
+
 ## 项目概述
 
 基于 **MCP 协议**构建的可扩展 LLM 智能体框架。核心理念：Agent 不关心工具内部实现，只需一套标准协议即可将**任意业务系统**接入为可调用的工具。已接入 RAG 知识库检索和天气查询，展示了 Agent 自主发现工具、判断意图、编排调用的完整链路。
@@ -40,6 +48,12 @@ python kb_manager.py repair                          # 校验 Chroma ⇔ db_meta
 python kb_manager.py rollback --list                 # 列出快照
 python kb_manager.py rollback <时间戳>               # 回退到指定快照
 python kb_manager.py clear --yes                     # 清空知识库
+
+# === RAG 评测 (RAGAS) ===
+python rag_eval/run_eval.py --config both            # 完整 A/B 评测(基线 vs 优化)
+python rag_eval/run_eval.py --config both --limit 2  # 小样本快跑(省 Token,先验证链路)
+python rag_eval/run_eval.py --config both --save-baseline  # 并保存基线快照
+python rag_eval/adapters.py                          # 自测 RAGAS 适配器(LLM/嵌入包装)
 ```
 
 ## 核心架构
@@ -61,7 +75,7 @@ python kb_manager.py clear --yes                     # 清空知识库
            │ MCP stdio 子进程                                │
            ▼                                                 │
 ┌──────────────────────────────────────────────────────────┐│
-│  mcp_server.py (5 个 MCP 工具)                            ││
+│  mcp_server.py (6 个 MCP 工具)                            ││
 │  query_weather / ask_knowledge_base / search_knowledge_base│
 │  check_kb_status / clear_memory / debug_rerank            ││
 └──────────┬───────────────────────────────────────────────┘│
@@ -70,7 +84,10 @@ python kb_manager.py clear --yes                     # 清空知识库
 ┌──────────────────────────────┐                             │
 │  RAG 检索管线                 │                             │
 │  document_loader → splitter  │                             │
-│  → ChromaDB → retriever     │                             │
+│  → ChromaDB ┐                │                             │
+│  query_rewriter(改写)         │                             │
+│  → hybrid_retriever          │                             │
+│    (BM25 + 向量 RRF 融合)     │                             │
 │  → reranker → LLM 生成       │                             │
 └──────────────────────────────┘                             │
 ```
@@ -88,12 +105,16 @@ python kb_manager.py clear --yes                     # 清空知识库
 | `frontend/` | **Vue 3 + Element Plus 管理后台**：用户/角色/分组/文档/审计 |
 | `vector_store.py` | ChromaDB 增量增删改、快照备份/回退、权限过滤、元数据索引 |
 | `kb_manager.py` | CLI 运维工具：10+ 命令管理向量库全生命周期 |
-| `retriever.py` | RAG 检索：双语检索 + Prompt 构建 + 权限上下文写入 |
+| `retriever.py` | RAG 检索主链路：查询改写 → 混合检索(双语) → 合并去重 → 重排 → Prompt 构建；`answer_with_fallback`(生产)与 `retrieve_and_answer`(评测,带 A/B 开关) |
+| `query_rewriter.py` | 查询改写：clarify(规范化+指代消解)/multi(多查询)/hyde 三模式 + LRU 缓存 + 埋点 + 无感降级 |
+| `hybrid_retriever.py` | 混合检索：BM25 稀疏 + 向量稠密双通道，RRF 加权融合，异常降级纯向量 |
+| `bm25_index.py` | BM25 关键词索引：jieba 分词 + 停用词过滤 + 内容签名驱动懒重建 + pkl 持久化 |
 | `reranker.py` | BGE-Reranker-v2-m3 Cross-Encoder 重排 + LLM 降级兜底 |
 | `document_loader.py` | 文档解析：PyMuPDF(PDF) + python-docx(DOCX) + PaddleOCR 降级通道 |
 | `text_splitter.py` | Markdown 标题切分 + 递归二次切分 + 小章节合并 |
 | `ocr_processor.py` | PaddleOCR/PP-Structure 懒加载 + 公式识别三级降级链 |
 | `token_tracker.py` | Token 用量追踪：会话累积 + 文件持久化 + 成本计算 |
+| `rag_eval/` | **RAGAS 评测体系**：A/B 对比(基线纯向量 vs 优化双语+重排)、4 指标量化(召回/精准/忠实/相关)、分层 + Bad Case + 成本报告；见 `RAG评测体系.md` |
 | `config.py` | 全局配置：LLM/嵌入/重排/权限/PDF 阈值/公式等所有配置项 |
 
 ## 关键设计决策
@@ -104,6 +125,9 @@ python kb_manager.py clear --yes                     # 清空知识库
 - **跨进程权限传递**：主进程 `app.py` 登录后 → `set_current_kb_groups()` 写 `kb_permission_context.json` → MCP 子进程 `vector_store.search()` 实时读取做 ChromaDB where 过滤
 - **精准备份而非全库拷贝**：删除/更新/清空前，只备份即将被删的 chunk 数据（ids+documents+metadatas+embeddings），回退时精确恢复到 ChromaDB
 - **快慢双通道 PDF 解析**：90% PDF 走 PyMuPDF 快速通道（多栏检测+标题聚类+页眉过滤），质量差的才启动 PaddleOCR（500MB+，懒加载）
+- **混合检索分工**：`hybrid_retriever` 用 RRF 融合 BM25+向量两路召回（只用排名不用绝对分数，回避余弦/BM25 分数不可比），融合后仍交 `reranker` 精排——RRF 负责"合成候选"，Cross-Encoder 负责"精排"，二者不冲突
+- **BM25 索引跨进程一致**：`bm25_index` 用"chunk 数+内容 hash"签名驱动懒重建，Streamlit 增删文档后 MCP 子进程检索时自动感知重建，无需侵入每个增删改函数
+- **改写/混合/评测全程可降级**：查询改写、混合检索、重排任一失败都无感回退（改写→原 query、混合→纯向量、Cross-Encoder→LLM→原序），主链路绝不中断；均由 config 开关控制
 - **Python 解释器**：自动检测 venv Python，确保 MCP 子进程使用正确环境
 - **`.env` 加载**：`config.py` 用 `Path(__file__).resolve().parent / ".env"` 绝对路径
 
@@ -118,3 +142,8 @@ python kb_manager.py clear --yes                     # 清空知识库
 - **ChromaDB 稳定 ID**：`chunk_id = {file_hash}_{index:04d}`，保证增量添加天然幂等
 - **source 兜底**：查 ChromaDB 时优先 `file_path`，无匹配兜底 `source`（basename），兼容老数据
 - **前端代理**：`vite.config.ts` 将 `/api` 代理到 `localhost:8000`，开发时无需跨域配置
+- **RAGAS + DeepSeek 兼容**：DeepSeek 只支持 `n=1`，RAGAS 部分指标默认多候选采样(`n>1`)会报 `400 Invalid n value`；解法是 `rag_eval/adapters.py` 里对 `LangchainLLMWrapper` 设 `bypass_n=True`
+- **RAGAS 评测清洗**：faithfulness 会把答案里的来源标注/免责声明误判为幻觉；`run_eval.py` 的 `clean_answer_for_eval()` 在打分前清洗这些格式(仅作用于评测副本，不改真实答案)
+- **推理模型 max_tokens 陷阱（重要）**：`LLM_MODEL=deepseek-v4-flash` 是推理模型，先输出 `reasoning_content` 再出正式 `content`；`max_tokens` 过小(如 50/120)会导致 token 被推理耗尽、`content` 返回空串。凡是"输出短但要它真回话"的调用(查询翻译/改写等)必须给足 `max_tokens`(≥512)，否则静默返回空
+- **RAGAS 打分防超时**：`run_eval.py` 的 `run_ragas()` 传 `RunConfig(timeout=180, max_workers=4, max_retries=3)`——DeepSeek 高并发下易超时，超时的 Job 会以 NaN 污染指标均值(报告显示 N/A)；降并发换干净数据
+- **混合检索/查询改写开关**：`HYBRID_ENABLED` / `QUERY_REWRITE_ENABLED`(config.py) 控制是否启用；BM25 索引持久化在 `bm25_index.pkl`，停用词表 `bm25_stopwords.txt`(不存在则不过滤)

@@ -117,14 +117,15 @@ SPLIT_HEADERS = [
 # ===== 公式识别配置 =====
 # 多 API 容灾链：百度智能云（免费额度）→ SimpleTex（备选）
 # 百度智能云・数学公式识别（个人实名后免费，每日数百次）
-BAIDU_OCR_API_KEY = "jxxUSajOCsqmJuKJFsWRKvoO"              # 百度智能云 API Key
-BAIDU_OCR_SECRET_KEY = "3FesrjvUPU9xweRtk8aSYunEbiCIuXch"           # 百度智能云 Secret Key
+# 密钥统一从 .env 读取，不硬编码到源码
+BAIDU_OCR_API_KEY = os.getenv("BAIDU_OCR_API_KEY", "")              # 百度智能云 API Key
+BAIDU_OCR_SECRET_KEY = os.getenv("BAIDU_OCR_SECRET_KEY", "")        # 百度智能云 Secret Key
 BAIDU_OCR_FORMULA_URL = "https://aip.baidubce.com/rest/2.0/ocr/v1/formula"
 BAIDU_OCR_GENERAL_URL = "https://aip.baidubce.com/rest/2.0/ocr/v1/general_basic"  # 通用文字识别
 BAIDU_OCR_TOKEN_URL = "https://aip.baidubce.com/oauth/2.0/token"
 # SimpleTex API（备选，免费 1000 次/月）
 SIMPLETEX_API_URL = "https://api.simpletex.cn/api/v1/ocr"
-SIMPLETEX_API_KEY = ""              # 在 https://simpletex.cn 注册获取
+SIMPLETEX_API_KEY = os.getenv("SIMPLETEX_API_KEY", "")             # 在 https://simpletex.cn 注册获取
 
 FORMULA_TIMEOUT = 8                 # 单次请求超时（秒）
 FORMULA_MAX_RETRIES = 3             # 最大重试次数
@@ -146,3 +147,21 @@ MATH_SYMBOLS = {
     '¹', '²', '³', '₀', '₁', '₂', '₃',
     '⟨', '⟩', '⌊', '⌋', '⌈', '⌉',
 }  # 用于判断文本行是否疑似公式
+
+# ===== 混合检索配置（BM25 + 向量 双通道 + RRF 融合）=====
+HYBRID_ENABLED = True                     # 混合检索总开关（False=退回纯向量）
+BM25_TOP_K = 10                           # BM25 单路召回数
+VECTOR_TOP_K = 10                         # 向量单路召回数
+RRF_K = 60                                # RRF 融合常数（越大越平滑，经验值 60）
+BM25_RRF_WEIGHT = 1.0                     # BM25 路 RRF 权重（预留，默认对等）
+VECTOR_RRF_WEIGHT = 1.0                   # 向量路 RRF 权重（预留，默认对等）
+BM25_INDEX_PATH = "./bm25_index.pkl"      # BM25 索引持久化文件
+BM25_STOPWORDS_PATH = "./bm25_stopwords.txt"  # 中文停用词表（可选，不存在则不过滤）
+
+# ===== 查询改写配置（Query Rewrite）=====
+QUERY_REWRITE_ENABLED = True              # 查询改写总开关
+QUERY_REWRITE_MODE = "clarify"            # clarify（规范化+指代消解）| multi（多查询）| hyde
+QUERY_REWRITE_MULTI_N = 3                 # multi 模式生成的 query 数
+QUERY_REWRITE_MAX_TOKENS = 512            # 改写输出上限（deepseek-v4-flash 是推理模型，需给 reasoning 留足空间，否则 content 为空）
+QUERY_REWRITE_CACHE_SIZE = 100            # 改写结果 LRU 缓存条数（0=关闭）
+QUERY_REWRITE_COREF_ROUNDS = 3            # 指代消解引用的最近对话轮次

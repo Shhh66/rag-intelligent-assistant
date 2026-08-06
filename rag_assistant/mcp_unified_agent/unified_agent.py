@@ -45,6 +45,14 @@ try:
 except ImportError:
     HAS_REFLECTION = False
 
+try:
+    import sys as _sys, os as _os
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+    from long_term_memory import get_memory
+    HAS_LONG_MEMORY = True
+except Exception:
+    HAS_LONG_MEMORY = False
+
 logger = logging.getLogger(__name__)
 
 logging.basicConfig(
@@ -364,6 +372,13 @@ class UnifiedAgent:
             hints = []
             if self._reflection:
                 hints = self._reflection.get_relevant_hints(user_input)
+            # 2b. 长期记忆检索注入（跨会话，按用户隔离；与 reflection hints 并列）
+            if HAS_LONG_MEMORY:
+                try:
+                    mem_hints = get_memory().retrieve(self._current_user_id(), user_input)
+                    hints = list(mem_hints) + list(hints)  # 长期记忆置前
+                except Exception:
+                    pass
             # 将前序轮次的工具结果注入提示，避免 LLM 不知情重复调用
             if all_results:
                 for r in all_results[-5:]:  # 最近 5 条
@@ -433,6 +448,8 @@ class UnifiedAgent:
                         result_preview=str(r.get("result", ""))[:200],
                         latency_ms=r.get("latency_ms", 0),
                     ))
+                # 6b. 短→长沉淀：某工具高频使用则沉淀为用户偏好（无需额外 LLM）
+                self._maybe_sediment_preference()
 
             # ── 工具结果处理 ──
             success_count = sum(1 for r in results if not r.get("is_error"))
@@ -485,6 +502,45 @@ class UnifiedAgent:
         self._history.append({"role": "assistant", "content": answer})
         if len(self._history) > 20:
             self._history = self._history[-20:]
+        # 长期记忆：抽取并存储（跨会话，降级安全，不阻断）
+        if HAS_LONG_MEMORY:
+            try:
+                get_memory().extract_and_store(
+                    self._current_user_id(), user_input, answer
+                )
+            except Exception:
+                pass
+
+    def _current_user_id(self) -> str:
+        """读取当前登录用户名（跨进程共享文件），供长期记忆隔离。"""
+        try:
+            from retriever import get_current_user
+            return get_current_user()
+        except Exception:
+            return "default"
+
+    def _maybe_sediment_preference(self, threshold: int = 3) -> None:
+        """短→长沉淀：某工具在反思记忆里成功使用达到阈值 → 沉淀为用户偏好。
+
+        复用 ReflectionMemory 已记录的 selected_tool，无需额外 LLM 调用。
+        每个工具每进程只沉淀一次（_sedimented 去重）。
+        """
+        if not (HAS_LONG_MEMORY and self._reflection):
+            return
+        try:
+            if not hasattr(self, "_sedimented"):
+                self._sedimented = set()
+            counts = {}
+            for e in list(self._reflection._entries):
+                if e.success:
+                    counts[e.selected_tool] = counts.get(e.selected_tool, 0) + 1
+            for tool, n in counts.items():
+                if n >= threshold and tool not in self._sedimented:
+                    self._sedimented.add(tool)
+                    get_memory().record_tool_preference(self._current_user_id(), tool)
+                    logger.info(f"沉淀用户偏好: 高频工具「{tool}」({n}次)")
+        except Exception:
+            pass
 
     def clear_memory(self) -> None:
         """清空对话记忆和反思记忆。"""

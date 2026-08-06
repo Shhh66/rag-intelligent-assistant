@@ -54,6 +54,10 @@ python rag_eval/run_eval.py --config both            # 完整 A/B 评测(基线 
 python rag_eval/run_eval.py --config both --limit 2  # 小样本快跑(省 Token,先验证链路)
 python rag_eval/run_eval.py --config both --save-baseline  # 并保存基线快照
 python rag_eval/adapters.py                          # 自测 RAGAS 适配器(LLM/嵌入包装)
+
+# === 可观测性 (LangFuse 自托管，可选) ===
+docker compose -f rag_assistant/docker-compose.langfuse.yml up -d   # 起 LangFuse → http://localhost:3000
+# 注册账号→建 project→拿 pk/sk 填 .env→config.LANGFUSE_ENABLED=True
 ```
 
 ## 核心架构
@@ -113,7 +117,10 @@ python rag_eval/adapters.py                          # 自测 RAGAS 适配器(LL
 | `document_loader.py` | 文档解析：PyMuPDF(PDF) + python-docx(DOCX) + PaddleOCR 降级通道 |
 | `text_splitter.py` | Markdown 标题切分 + 递归二次切分 + 小章节合并 |
 | `ocr_processor.py` | PaddleOCR/PP-Structure 懒加载 + 公式识别三级降级链 |
-| `token_tracker.py` | Token 用量追踪：会话累积 + 文件持久化 + 成本计算 |
+| `token_tracker.py` | Token 用量追踪：会话累积 + 文件持久化 + 成本计算；`set_trace_id()` + `record()` 上报 LangFuse generation |
+| `long_term_memory.py` | **长期记忆**：跨会话实体记忆(Chroma 语义 + SQLite 结构化)，LLM 抽取 + 按用户隔离 + 去重/权重/时间衰减 + 短→长沉淀 |
+| `tool_audit.py` | **工具调用审计**：trace_id/入参脱敏/结果摘要/耗时/成败/重试数 → `tool_audit.jsonl`(实时追加) |
+| `observability.py` | **LangFuse 可观测**：全链路 span/generation 封装，降级安全(未启用/服务未起全 no-op) |
 | `rag_eval/` | **RAGAS 评测体系**：A/B 对比(基线纯向量 vs 优化双语+重排)、4 指标量化(召回/精准/忠实/相关)、分层 + Bad Case + 成本报告；见 `RAG评测体系.md` |
 | `config.py` | 全局配置：LLM/嵌入/重排/权限/PDF 阈值/公式等所有配置项 |
 
@@ -147,3 +154,9 @@ python rag_eval/adapters.py                          # 自测 RAGAS 适配器(LL
 - **推理模型 max_tokens 陷阱（重要）**：`LLM_MODEL=deepseek-v4-flash` 是推理模型，先输出 `reasoning_content` 再出正式 `content`；`max_tokens` 过小(如 50/120)会导致 token 被推理耗尽、`content` 返回空串。凡是"输出短但要它真回话"的调用(查询翻译/改写等)必须给足 `max_tokens`(≥512)，否则静默返回空
 - **RAGAS 打分防超时**：`run_eval.py` 的 `run_ragas()` 传 `RunConfig(timeout=180, max_workers=4, max_retries=3)`——DeepSeek 高并发下易超时，超时的 Job 会以 NaN 污染指标均值(报告显示 N/A)；降并发换干净数据
 - **混合检索/查询改写开关**：`HYBRID_ENABLED` / `QUERY_REWRITE_ENABLED`(config.py) 控制是否启用；BM25 索引持久化在 `bm25_index.pkl`，停用词表 `bm25_stopwords.txt`(不存在则不过滤)
+- **工具调用统一重试**：`mcp_client_manager.call_tool` 用 tenacity 指数退避，`scheduler` 与 `skill_executor` 两路径共用此层自动统一；只重试瞬时故障(超时/连接)，业务错误(isError)/参数校验失败不重试；`_execute_one` 已去掉外层 `wait_for`(超时+重试下沉到 call_tool)
+- **trace_id 贯穿**：`unified_agent._run()` 生成 `uuid4().hex`，透传 Scheduler/SkillExecutor + `token_tracker.set_trace_id()`，一问多工具在审计与 LangFuse 里归并同一链路
+- **protobuf 冲突(重要)**：`langfuse` 会把 protobuf 拉到 7.x，但 `paddlepaddle 2.6.2` 要求 `protobuf<=3.20.2`(否则 paddle/OCR 崩)；装完 langfuse 必须 `pip install "protobuf<=3.20.2"` 回退，langfuse 走 HTTP 不受影响
+- **LangFuse 默认关**：`LANGFUSE_ENABLED=False`；observability.py 全程降级安全(未启用/缺密钥/服务未起均 no-op，不阻断主链路)
+- **长期记忆按用户隔离**：`retriever.set_current_user(username)` 写 `memory_user_context.json`(仿 kb 权限跨进程模式)，`long_term_memory` 按 user_id 过滤；`app.py` 登录/登出时设置。独立于 `clear_memory()`(清会话不清长期记忆)
+- **长期记忆检索用距离分**：本地嵌入的 `similarity_search_with_relevance_scores` 会返回负值(同 reranker logits 非概率问题)，改用 `similarity_search_with_score` 距离分转 `1/(1+dist)`；抽取 LLM 调用 `max_tokens≥512`(推理模型陷阱)

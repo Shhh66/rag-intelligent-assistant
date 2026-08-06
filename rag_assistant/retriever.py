@@ -39,6 +39,31 @@ def set_current_kb_groups(groups: list):
           file=sys.stderr, flush=True)
 
 
+# 长期记忆用户身份（跨进程共享，仿权限上下文模式）
+_MEMORY_USER_CONTEXT_FILE = _os.path.join(
+    _os.path.dirname(_os.path.abspath(__file__)),
+    "memory_user_context.json",
+)
+
+
+def set_current_user(username: str):
+    """设置当前登录用户名（app.py 登录后调用），供长期记忆按用户隔离。"""
+    try:
+        with open(_MEMORY_USER_CONTEXT_FILE, "w", encoding="utf-8") as f:
+            _json.dump({"user_id": username or "default"}, f)
+    except Exception as e:
+        print(f"   ⚠️ 写入用户身份失败: {e}", file=sys.stderr, flush=True)
+
+
+def get_current_user() -> str:
+    """读取当前用户名（跨进程），无则返回 'default'。"""
+    try:
+        with open(_MEMORY_USER_CONTEXT_FILE, "r", encoding="utf-8") as f:
+            return _json.load(f).get("user_id", "default") or "default"
+    except Exception:
+        return "default"
+
+
 def _get_context_kb_groups():
     """从共享文件读取权限分组（跨进程兼容）"""
     try:

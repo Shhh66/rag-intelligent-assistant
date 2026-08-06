@@ -213,6 +213,38 @@ async def clear_memory() -> str:
     return "对话记忆已清空。（记忆由智能体统一管理，此操作已通知智能体）"
 
 
+# ═══════════════════════════════════════════════
+# 河海大学教务系统工具
+# ═══════════════════════════════════════════════
+
+_edu_session = None
+
+def _get_edu_session():
+    global _edu_session
+    if _edu_session is None:
+        from tools_edu import HuleSession
+        _edu_session = HuleSession()
+        if not _edu_session.check_session():
+            _edu_session.login()
+    return _edu_session
+
+
+@mcp.tool()
+async def edu_query_schedule(week: str = "", semester: str = "") -> str:
+    """查询河海大学课表。
+
+    :param week: 第几周(1-20),留空=当前周(暑假建议指定,如'8')
+    :param semester: 学期ID(如'2024-2025-2'为春季,'2024-2025-1'为秋季),留空=当前学期(暑假无课)
+    :return: 按周几+节次排列的课程列表(课程名/教师/周次/教室)
+    """
+    edu = _get_edu_session()
+    if not edu.check_session():
+        ok = edu.login()
+        if not ok:
+            return "❌ 教务系统登录失败，请检查学号密码配置"
+    return await asyncio.to_thread(edu.fetch_schedule, xnxq01id=semester, zc=week)
+
+
 if __name__ == "__main__":
     sys.stdout = _original_stdout  # 恢复 stdout，MCP 协议需要它
     mcp.run(transport="stdio")

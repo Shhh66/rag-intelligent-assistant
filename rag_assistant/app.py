@@ -13,7 +13,7 @@ from agent import Agent
 from evaluation import EvaluationLogger
 from token_tracker import get_tracker
 import requests as _requests
-from retriever import set_current_kb_groups
+from retriever import set_current_kb_groups, set_current_user
 
 # ===== 页面设置 =====
 st.set_page_config(
@@ -149,6 +149,7 @@ with st.sidebar:
                     if not kb_groups:
                         kb_groups = None
                     set_current_kb_groups(kb_groups)
+                    set_current_user(data["user"].get("username", "default"))
                     st.rerun()
                 else:
                     st.error(f"登录失败: {resp.json().get('detail', '未知错误')}")
@@ -170,6 +171,7 @@ with st.sidebar:
             for k in ["auth_token", "auth_user"]:
                 st.session_state.pop(k, None)
             set_current_kb_groups(None)
+            set_current_user("default")
             st.rerun()
 
     # ── 知识库状态 ──

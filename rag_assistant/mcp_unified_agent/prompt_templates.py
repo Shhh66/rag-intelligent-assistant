@@ -86,6 +86,12 @@ def build_decision_prompt(
                 "\n\n⚠️ 上述工具已在本轮执行完毕并返回结果，"
                 "请使用 direct_answer 汇总结果回答用户，不要再调用工具。"
             )
+        # 长期记忆护栏：降低记忆污染导致的幻觉
+        if any("长期记忆" in h for h in reflection_hints):
+            hints_text += (
+                "\n\n💡 「长期记忆」是跨会话沉淀的用户背景，"
+                "仅在与当前问题相关时参考，无关内容请直接忽略，不要生搬硬套。"
+            )
     else:
         hints_text = "（无历史工具选择记录）"
 

@@ -184,3 +184,20 @@ LANGFUSE_ENABLED = False                  # 总开关（默认关，需先起 La
 LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY", "")
 LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY", "")
 LANGFUSE_HOST = os.getenv("LANGFUSE_HOST", "http://localhost:3000")
+
+# ===== 长期记忆（跨会话实体记忆与检索）=====
+LONG_TERM_MEMORY_ENABLED = True           # 长期记忆总开关
+MEMORY_DB_PATH = "./memory.db"            # SQLite 结构化存储（实体事实）
+MEMORY_COLLECTION = "memory"              # Chroma collection（独立于 langchain 主库）
+MEMORY_RETRIEVE_TOP_K = 3                 # 每轮注入的记忆条数
+MEMORY_EXTRACT_ENABLED = True             # 实体抽取开关（False=仅存对话摘要，即 V0.5）
+MEMORY_EXTRACT_MAX_TOKENS = 512           # 抽取 LLM max_tokens（推理模型需给足，否则 content 空）
+MEMORY_DECAY_DAYS = 90                    # 记忆时间衰减：超过此天数显著降权
+MEMORY_DEDUP_SIM = 0.85                   # 抽取去重相似度阈值（>此值视为同一记忆，更新而非新增）
+MEMORY_USER_CONTEXT_FILE = "memory_user_context.json"  # 跨进程用户身份传递
+# 记忆类型权重（注入排序用）：用户画像 > 项目实体 > 历史结论
+MEMORY_TYPE_WEIGHTS = {"profile": 1.0, "entity": 0.7, "conclusion": 0.4}
+
+# ===== 河海大学教务系统 =====
+EDU_STUDENT_ID = os.getenv("EDU_STUDENT_ID", "")
+EDU_PASSWORD = os.getenv("EDU_PASSWORD", "")

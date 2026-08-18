@@ -3,6 +3,7 @@
 启动: uvicorn api_server:app --port 8000
 """
 
+import sys
 import sqlite3
 import json
 import hashlib
@@ -192,16 +193,33 @@ def _create_token(user_id: int, username: str, permissions: list,
 
 
 def get_current_user(token=Depends(security)):
-    """JWT 中间件：解析用户身份"""
+    """JWT 鉴权 + 用户级限流：解析用户身份，顺带限流（超限 429）。
+
+    限流挂在 get_current_user 而非逐个端点——它是所有鉴权端点的公共入口
+    （login 除外），一次覆盖全部。fail-open：Redis 挂了限流放行。
+    """
     try:
         payload = jwt.decode(
             token.credentials, KB_PERMISSION_SECRET_KEY, algorithms=["HS256"]
         )
-        return payload
     except jwt.ExpiredSignatureError:
         raise HTTPException(401, "Token 已过期")
     except jwt.InvalidTokenError:
         raise HTTPException(401, "Token 无效")
+
+    # 用户级限流：每个登录用户有请求频率配额，超限 429
+    try:
+        from rate_limiter import get_user_limiter
+        username = payload.get("username", "unknown")
+        if not get_user_limiter().allow(username):
+            print(f"   🚦 用户限流触发 (user={username})", file=sys.stderr, flush=True)
+            raise HTTPException(429, "请求过于频繁，请稍后重试")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"   ⚠️ 用户限流检查失败(忽略): {e}", file=sys.stderr, flush=True)
+
+    return payload
 
 
 def require_permission(permission: str):

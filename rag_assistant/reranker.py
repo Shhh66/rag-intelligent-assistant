@@ -15,6 +15,7 @@ from config import (
     RERANK_ENABLED, RERANK_STRATEGY, RERANK_TOP_K,
     RERANK_MAX_CANDIDATES, RERANK_MODEL,
     RERANK_MAX_TOKENS, RERANK_MIN_SCORE, RERANK_CALIBRATION_MAX_RATIO,
+    RERANK_SERVER_URL, RERANK_SERVER_TIMEOUT,
 )
 
 
@@ -183,30 +184,54 @@ def _calibrate_bilingual_scores(docs: list, scores: list) -> list:
 # 重排策略
 # ═══════════════════════════════════════════════════════════════
 
+def _rerank_via_http(query: str, texts: list) -> list:
+    """通过重排服务打分，返回 logits 列表（失败抛异常，由调用方降级本地模型）"""
+    import httpx
+    url = RERANK_SERVER_URL.rstrip("/") + "/rerank"
+    with httpx.Client(timeout=RERANK_SERVER_TIMEOUT) as client:
+        resp = client.post(url, json={"query": query, "texts": texts})
+        resp.raise_for_status()
+        scores = resp.json().get("scores", [])
+    if len(scores) != len(texts):
+        raise ValueError(f"重排服务返回数量不一致: {len(scores)} != {len(texts)}")
+    return scores
+
+
 def rerank_cross_encoder(query: str, docs: list) -> list:
-    """BGE-Reranker 精排（默认策略）"""
+    """BGE-Reranker 精排（默认策略）
+
+    优先走独立重排服务（RERANK_SERVER_URL 配置时），服务不可用自动降级本地模型。
+    """
     if len(docs) <= 1:
         return docs
-
-    tokenizer, model = _get_reranker()
-    device = _get_device()
 
     # 拼接标题路径 + 智能截断
     texts = [_smart_truncate(_build_rerank_text(d), query) for d in docs]
 
-    # 先尝试批量推理
-    try:
-        pairs = [[query, t] for t in texts]
-        with torch.no_grad():
-            inputs = tokenizer(pairs, padding=True, truncation=True,
-                              max_length=512, return_tensors="pt")
-            if device != "cpu":
-                inputs = {k: v.to(device) for k, v in inputs.items()}
-            scores = model(**inputs, return_dict=True).logits.view(-1).cpu().tolist()
-    except Exception:
-        # 批量失败 → 降级循环单条
-        print("   ⚠️ 批量推理失败，降级循环单条打分", file=sys.stderr, flush=True)
-        scores = [_compute_pair_score(query, t, tokenizer, model, device) for t in texts]
+    # ① 优先 HTTP 重排服务
+    scores = None
+    if RERANK_SERVER_URL:
+        try:
+            scores = _rerank_via_http(query, texts)
+        except Exception as e:
+            print(f"   ⚠️ 重排服务不可用 ({e})，降级本地模型", file=sys.stderr, flush=True)
+
+    # ② 降级本地模型打分
+    if scores is None:
+        tokenizer, model = _get_reranker()
+        device = _get_device()
+        try:
+            pairs = [[query, t] for t in texts]
+            with torch.no_grad():
+                inputs = tokenizer(pairs, padding=True, truncation=True,
+                                  max_length=512, return_tensors="pt")
+                if device != "cpu":
+                    inputs = {k: v.to(device) for k, v in inputs.items()}
+                scores = model(**inputs, return_dict=True).logits.view(-1).cpu().tolist()
+        except Exception:
+            # 批量失败 → 降级循环单条
+            print("   ⚠️ 批量推理失败，降级循环单条打分", file=sys.stderr, flush=True)
+            scores = [_compute_pair_score(query, t, tokenizer, model, device) for t in texts]
 
     # 双语校准
     scores = _calibrate_bilingual_scores(docs, scores)

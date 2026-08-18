@@ -23,6 +23,7 @@ class ToolMeta:
     description: str
     input_schema: dict           # JSON Schema dict，用于参数校验
     source_server: str = "mcp_server"  # 预留多服务器扩展
+    required_perms: list = field(default_factory=lambda: ["*"])  # 所需权限，["*"]=公开
 
     @classmethod
     def from_mcp_tool(cls, tool) -> "ToolMeta":
@@ -31,7 +32,16 @@ class ToolMeta:
             name=tool.name,
             description=tool.description or "",
             input_schema=tool.inputSchema or {},
+            required_perms=cls._extract_required_perms(tool),
         )
+
+    @staticmethod
+    def _extract_required_perms(tool) -> list:
+        """从 MCP Tool 的 meta 字段提取 required_perms（未声明默认 ["*"] 公开）。"""
+        meta = getattr(tool, 'meta', None) or getattr(tool, '_meta', None)
+        if isinstance(meta, dict) and "required_perms" in meta:
+            return meta["required_perms"]
+        return ["*"]
 
 
 class ToolRegistry:

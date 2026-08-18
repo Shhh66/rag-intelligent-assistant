@@ -86,6 +86,39 @@ def log_tool_call(
         logger.warning(f"工具审计写入失败(忽略): {e}")
 
 
+def log_decision(
+    trace_id: str,
+    turn: int,
+    action: str,
+    thought: str = "",
+    tool_names: list = None,
+    skill_name: str = "",
+) -> None:
+    """记录一条 ReAct 决策（思考留痕，与工具调用审计同一 jsonl、同一 trace_id）。
+
+    合规要求「每一步思考可回溯」——记录 Agent 每轮决策的行动类型、思考、拟调工具。
+    用 type="decision" 区分工具调用记录（type 缺省 = 工具调用）。
+    """
+    enabled, path, maxlen, sensitive = _cfg()
+    if not enabled:
+        return
+    try:
+        entry = {
+            "type": "decision",
+            "timestamp": datetime.now().isoformat(),
+            "trace_id": trace_id or "",
+            "turn": turn,
+            "action": action,
+            "thought": (thought or "")[:300],
+            "tool_names": tool_names or [],
+            "skill_name": skill_name or "",
+        }
+        with open(_audit_path(path), "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning(f"决策审计写入失败(忽略): {e}")
+
+
 # ── 自测 ──
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8")

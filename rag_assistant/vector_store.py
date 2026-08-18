@@ -20,6 +20,8 @@ from config import (
     VECTOR_DB_PATH, EMBEDDING_MODEL, TOP_K, HF_ENDPOINT,
     KB_META_FILE, KB_LOCK_FILE, KB_SNAPSHOT_DIR,
     SNAPSHOT_MAX_COUNT, SOFT_DELETE,
+    EMBED_SERVER_URL, EMBED_SERVER_TIMEOUT,
+    CHROMA_SERVER_URL,
 )
 
 
@@ -31,8 +33,54 @@ _embeddings = None
 
 
 # ═══════════════════════════════════════════════════════════════
-# 嵌入模型（保持不变）
+# ChromaDB 客户端工厂（单机 PersistentClient / 多实例 HttpClient）
 # ═══════════════════════════════════════════════════════════════
+
+def _get_client():
+    """按配置返回 PersistentClient 或 HttpClient（单机 vs 多实例共享）。
+
+    CHROMA_SERVER_URL 空 → PersistentClient（本地目录，单机）
+    CHROMA_SERVER_URL 非空 → HttpClient（client-server，多实例共享同一库）
+    """
+    if CHROMA_SERVER_URL:
+        # 例：http://localhost:8000
+        url = CHROMA_SERVER_URL.rstrip("/")
+        parts = url.replace("http://", "").replace("https://", "").split(":")
+        host = parts[0]
+        port = int(parts[1]) if len(parts) > 1 else 8000
+        return chromadb.HttpClient(host=host, port=port)
+    return chromadb.PersistentClient(path=VECTOR_DB_PATH)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 嵌入模型（本地加载 / 独立服务 二选一）
+# ═══════════════════════════════════════════════════════════════
+
+class HttpEmbeddings:
+    """通过独立嵌入服务向量化（走 HTTP）。
+
+    实现 LangChain Chroma 所需的 embedding 接口（鸭子类型）：
+      embed_documents(texts) -> list[list[float]]
+      embed_query(text)      -> list[float]
+    配置了 EMBED_SERVER_URL 时使用，否则回退本地 HuggingFaceEmbeddings。
+    """
+
+    def __init__(self, base_url: str, timeout: float = 60.0):
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+
+    def embed_documents(self, texts):
+        import httpx
+        if not texts:
+            return []
+        url = f"{self.base_url}/embed"
+        with httpx.Client(timeout=self.timeout) as client:
+            resp = client.post(url, json={"texts": list(texts)})
+            resp.raise_for_status()
+            return resp.json()["embeddings"]
+
+    def embed_query(self, text):
+        return self.embed_documents([text])[0]
 
 def _model_is_cached() -> bool:
     """检查嵌入模型是否已在本地缓存"""
@@ -45,26 +93,33 @@ def _model_is_cached() -> bool:
 
 
 def get_embeddings():
-    """获取嵌入模型（懒加载，优先本地缓存，否则从镜像下载）"""
+    """获取嵌入模型（懒加载，优先本地缓存，否则从镜像下载）
+
+    配置了 EMBED_SERVER_URL 时走独立嵌入服务（HTTP），否则本地加载模型。
+    """
     global _embeddings
     if _embeddings is None:
-        model_name = f"sentence-transformers/{EMBEDDING_MODEL}"
-
-        if _model_is_cached():
-            print(f"   ⏳ 加载本地嵌入模型（使用缓存，离线模式）...", file=sys.stderr, flush=True)
-            _embeddings = HuggingFaceEmbeddings(
-                model_name=model_name,
-                model_kwargs={"device": "cpu", "local_files_only": True},
-            )
+        if EMBED_SERVER_URL:
+            # 走独立嵌入服务，无需在本地进程加载 420MB 模型
+            _embeddings = HttpEmbeddings(EMBED_SERVER_URL, EMBED_SERVER_TIMEOUT)
+            print(f"   ✅ 使用嵌入服务: {EMBED_SERVER_URL}", file=sys.stderr, flush=True)
         else:
-            if "HF_ENDPOINT" not in os.environ:
-                os.environ["HF_ENDPOINT"] = HF_ENDPOINT
-            print(f"   ⏳ 下载嵌入模型（镜像: {HF_ENDPOINT}，仅首次需要）...", file=sys.stderr, flush=True)
-            _embeddings = HuggingFaceEmbeddings(
-                model_name=model_name,
-                model_kwargs={"device": "cpu"},
-            )
-        print(f"   ✅ 嵌入模型加载完成: {EMBEDDING_MODEL}", file=sys.stderr, flush=True)
+            model_name = f"sentence-transformers/{EMBEDDING_MODEL}"
+            if _model_is_cached():
+                print(f"   ⏳ 加载本地嵌入模型（使用缓存，离线模式）...", file=sys.stderr, flush=True)
+                _embeddings = HuggingFaceEmbeddings(
+                    model_name=model_name,
+                    model_kwargs={"device": "cpu", "local_files_only": True},
+                )
+            else:
+                if "HF_ENDPOINT" not in os.environ:
+                    os.environ["HF_ENDPOINT"] = HF_ENDPOINT
+                print(f"   ⏳ 下载嵌入模型（镜像: {HF_ENDPOINT}，仅首次需要）...", file=sys.stderr, flush=True)
+                _embeddings = HuggingFaceEmbeddings(
+                    model_name=model_name,
+                    model_kwargs={"device": "cpu"},
+                )
+            print(f"   ✅ 嵌入模型加载完成: {EMBEDDING_MODEL}", file=sys.stderr, flush=True)
     return _embeddings
 
 
@@ -80,6 +135,7 @@ def build_vector_store(docs: List[Document]) -> Chroma:
     db_path.mkdir(parents=True, exist_ok=True)
 
     # 用 ChromaDB 自身 API 清理旧数据（避免文件锁冲突）
+    # 构建是离线运维操作，始终写本地 PersistentClient（不随 CHROMA_SERVER_URL 走远程）
     client = chromadb.PersistentClient(path=str(db_path))
     try:
         client.delete_collection("langchain")
@@ -133,8 +189,19 @@ def _rebuild_meta(docs: List[Document]):
 
 
 def load_vector_store() -> Chroma:
-    """加载已有的向量库"""
+    """加载已有的向量库（支持单机 PersistentClient / 多实例 HttpClient）"""
     embeddings = get_embeddings()
+
+    # client-server 模式：走 Chroma Server，无需本地目录存在
+    if CHROMA_SERVER_URL:
+        client = _get_client()
+        return Chroma(
+            client=client,
+            embedding_function=embeddings,
+            collection_name="langchain",
+        )
+
+    # 单机模式：本地目录必须存在
     db_path = Path(VECTOR_DB_PATH)
     if not db_path.exists() or not list(db_path.iterdir()):
         raise FileNotFoundError(f"向量库不存在: {VECTOR_DB_PATH}\n请先上传文档构建知识库。")
@@ -145,37 +212,21 @@ def load_vector_store() -> Chroma:
     )
 
 
-def search(query: str, top_k: int = TOP_K):
-    """在向量库中检索最相似的文档片段（自动读取权限上下文并过滤）"""
-    # 从共享文件读取权限上下文，有则走权限过滤
-    kb_groups = _get_context_kb_groups()
-    if kb_groups:
-        return search_with_permission(query, kb_groups=kb_groups, top_k=top_k)
+def search(query: str, top_k: int = TOP_K, kb_groups: list = None):
+    """在向量库中检索最相似的文档片段（权限通过 kb_groups 参数显式传入）
 
-    vector_store = load_vector_store()
-    results = vector_store.similarity_search(query, k=top_k)
-    return results
+    kb_groups 语义：
+      None（默认）→ 不限权限（管理员/未登录），无过滤
+      [...]       → 显式权限过滤（请求级，并发安全，不依赖全局文件）
+      []          → 仅 public 文档
+    """
+    if kb_groups is None:
+        # None = 不限权限（管理员 / 未登录）→ 无过滤
+        vector_store = load_vector_store()
+        return vector_store.similarity_search(query, k=top_k)
 
-
-# 权限上下文文件
-import json as _json
-import os as _os
-_KB_PERMISSION_CONTEXT_FILE = _os.path.join(
-    _os.path.dirname(_os.path.abspath(__file__)),
-    "kb_permission_context.json",
-)
-
-
-def _get_context_kb_groups():
-    """从共享文件读取权限分组"""
-    try:
-        with open(_KB_PERMISSION_CONTEXT_FILE, "r", encoding="utf-8") as f:
-            groups = _json.load(f)
-            if groups:
-                print(f"   🔒 权限过滤: {groups}", file=sys.stderr, flush=True)
-            return groups if groups else None
-    except Exception:
-        return None
+    # 非 None（含空列表 []）→ 显式权限过滤
+    return search_with_permission(query, kb_groups=kb_groups, top_k=top_k)
 
 
 def search_with_permission(query: str, kb_groups: list = None,
@@ -308,7 +359,7 @@ def _backup_snapshot(operation: str) -> str:
         shutil.copy2(meta_path, snapshot_dir / f"db_meta.{timestamp}.bak")
 
     # 备份当前所有 chunk ID（从 Chroma 查询）
-    client = chromadb.PersistentClient(path=VECTOR_DB_PATH)
+    client = _get_client()
     try:
         col = client.get_collection("langchain")
         all_data = col.get()
@@ -390,7 +441,7 @@ def _restore_chunks(backup_name: str) -> int:
     if not ids:
         return 0
 
-    client = chromadb.PersistentClient(path=VECTOR_DB_PATH)
+    client = _get_client()
     try:
         col = client.get_collection("langchain")
     except Exception:
@@ -607,7 +658,7 @@ def _add_document_locked(file_path: str, skip_duplicate: bool,
     embeddings = get_embeddings()
 
     # 批量写入 Chroma（使用稳定 ID，天然幂等）
-    client = chromadb.PersistentClient(path=VECTOR_DB_PATH)
+    client = _get_client()
     try:
         col = client.get_collection("langchain")
     except Exception:
@@ -684,7 +735,7 @@ def _remove_document_locked(file_path: str) -> dict:
     # 快照备份（db_meta.json + 快照索引）
     snapshot_ts = _backup_snapshot(f"remove: {rel_path}")
 
-    client = chromadb.PersistentClient(path=VECTOR_DB_PATH)
+    client = _get_client()
     try:
         col = client.get_collection("langchain")
     except Exception:
@@ -797,7 +848,7 @@ def _update_document_locked(abs_path: str, rel_path: str, new_hash: str, old_has
 
     # 2. 先写入新版本（用稳定 ID 天然幂等）
     embeddings = get_embeddings()
-    client = chromadb.PersistentClient(path=VECTOR_DB_PATH)
+    client = _get_client()
     try:
         col = client.get_collection("langchain")
     except Exception:
@@ -912,7 +963,7 @@ def repair() -> dict:
     """
     from collections import defaultdict
 
-    client = chromadb.PersistentClient(path=VECTOR_DB_PATH)
+    client = _get_client()
     try:
         col = client.get_collection("langchain")
         all_data = col.get()
@@ -979,7 +1030,7 @@ def migrate() -> dict:
 
     Returns: {"migrated_chunks": int, "documents_found": int}
     """
-    client = chromadb.PersistentClient(path=VECTOR_DB_PATH)
+    client = _get_client()
     try:
         col = client.get_collection("langchain")
         all_data = col.get()
@@ -1042,7 +1093,7 @@ def update_doc_permission(file_path: str, kb_group: str = None,
 
     Returns: {"file_path": str, "updated_chunks": int, "error": str|None}
     """
-    client = chromadb.PersistentClient(path=VECTOR_DB_PATH)
+    client = _get_client()
     try:
         col = client.get_collection("langchain")
     except Exception:

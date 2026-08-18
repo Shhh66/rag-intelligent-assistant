@@ -18,6 +18,9 @@ from .decision_engine import ToolDecision
 
 logger = logging.getLogger(__name__)
 
+# 需要注入 kb_groups（权限分组）的知识库工具
+_KB_TOOLS = {"ask_knowledge_base", "search_knowledge_base", "debug_rerank"}
+
 
 class Scheduler:
     """工具调用调度器：支持串行和并行两种执行模式。
@@ -34,11 +37,20 @@ class Scheduler:
         registry: ToolRegistry,
         default_timeout: float = 60.0,
         trace_id: str = "",
+        kb_groups: list = None,
+        permissions: list = None,
     ):
         self.mcp_client = mcp_client
         self.registry = registry
         self.default_timeout = default_timeout
         self.trace_id = trace_id
+        self.kb_groups = kb_groups  # 请求级权限分组（None=不限权限，不注入）
+        self.permissions = permissions  # 请求级工具权限（None=不限，不校验）
+        try:
+            from config import TOOL_PERMISSION_ENABLED
+            self.tool_perm_enabled = TOOL_PERMISSION_ENABLED
+        except Exception:
+            self.tool_perm_enabled = False  # 降级：默认关闭鉴权
 
     async def execute(
         self,
@@ -87,12 +99,30 @@ class Scheduler:
     async def _execute_one(self, decision: ToolDecision) -> dict:
         """执行单个工具调用：
 
-        1. registry.validate(name, args) -- 参数校验
-        2. mcp_client.call_tool(name, args) -- MCP 调用（自带超时+重试退避）
-        3. 从 CallToolResult 中提取文本内容
-        4. 记录耗时和错误状态 + 结构化审计(trace_id)
+        1. 注入 kb_groups（知识库工具，请求级权限）
+        2. registry.validate(name, args) -- 参数校验
+        3. mcp_client.call_tool(name, args) -- MCP 调用（自带超时+重试退避）
+        4. 从 CallToolResult 中提取文本内容
+        5. 记录耗时和错误状态 + 结构化审计(trace_id)
         """
         start = time.time()
+
+        # 0. 工具级权限校验（收口，fail-closed：未声明权限的敏感工具默认拒绝）
+        if self.tool_perm_enabled and self.permissions is not None:
+            denied = self._check_tool_permission(decision.tool_name)
+            if denied:
+                return {
+                    "tool_name": decision.tool_name,
+                    "arguments": decision.arguments,
+                    "result": f"权限拒绝: 缺少 {denied} 权限",
+                    "is_error": True,
+                    "latency_ms": 0.0,
+                }
+
+        # 0b. 注入权限分组（仅知识库工具 + 显式传了 kb_groups 时）
+        #    直接改写 decision.arguments，后续 validate/call_tool/audit/返回 自动生效
+        if self.kb_groups is not None and decision.tool_name in _KB_TOOLS:
+            decision.arguments = {**(decision.arguments or {}), "kb_groups": self.kb_groups}
 
         # 1. 参数校验（失败不重试、不计入工具审计的重试）
         valid, error_msg = self.registry.validate(
@@ -161,6 +191,24 @@ class Scheduler:
                 "is_error": True,
                 "latency_ms": round(latency, 2),
             }
+
+    # ── 工具权限校验 ──────────────────────────────────────────
+
+    def _check_tool_permission(self, tool_name: str) -> str | None:
+        """工具级权限校验：返回缺失的权限名（None=有权限/公开）。
+
+        - 未在 registry 注册的工具 → 拒绝（fail-closed）
+        - required_perms == ["*"] → 公开，放行
+        - 否则校验 permissions 是否覆盖 required_perms
+        """
+        meta = self.registry.get(tool_name)
+        if meta is None:
+            return "（工具未注册）"
+        required = meta.required_perms or ["*"]
+        if required == ["*"]:
+            return None
+        missing = [p for p in required if p not in (self.permissions or [])]
+        return missing[0] if missing else None
 
     # ── 审计 ──────────────────────────────────────────────────
 

@@ -101,12 +101,49 @@ RERANK_MODEL = "BAAI/bge-reranker-v2-m3"    # Cross-Encoder 模型名（多语�
 RERANK_CALIBRATION_MAX_RATIO = 1.2          # 双语校准最大补偿倍数（防止过度补偿）
 
 # ===== 权限控制配置 =====
-KB_PERMISSION_ENABLED = False                # 是否启用权限过滤（False=全量文档可检索，兼容旧行为）
 KB_DEFAULT_GROUP = "default"                 # 默认知识库分组
 KB_DEFAULT_VISIBILITY = "internal"           # 默认可见性（public | internal）
 KB_PERMISSION_DB = "./permission.db"         # SQLite 权限数据库路径
-KB_PERMISSION_SECRET_KEY = "rag-kb-secret-change-in-production"  # JWT 签名密钥（生产环境需修改）
+KB_PERMISSION_SECRET_KEY = os.getenv("KB_PERMISSION_SECRET_KEY", "rag-kb-secret-change-in-production")  # JWT 签名密钥（生产环境用 .env 覆盖）
 KB_PERMISSION_TOKEN_EXPIRE_HOURS = 24        # JWT Token 过期时间（小时）
+
+# ===== 模型服务化配置（部署运维改造）=====
+# 嵌入/重排模型独立服务地址。留空 = 内嵌进程加载（默认，兼容旧行为）。
+# 设置后走 HTTP 调用，支持多实例共享模型、独立扩缩容、模型升级不停服务。
+# 支持环境变量覆盖（容器化时由 docker-compose environment 注入）。
+# 例：EMBED_SERVER_URL = "http://localhost:8001"
+EMBED_SERVER_URL = os.getenv("EMBED_SERVER_URL", "")   # 嵌入模型服务地址（留空=本地加载）
+RERANK_SERVER_URL = os.getenv("RERANK_SERVER_URL", "") # 重排模型服务地址（留空=本地加载）
+EMBED_SERVER_TIMEOUT = 60.0                  # 嵌入服务单次请求超时（秒，含首次冷启动）
+RERANK_SERVER_TIMEOUT = 60.0                 # 重排服务单次请求超时（秒）
+
+# ===== 工具调用熔断器配置（CLOSED/OPEN/HALF_OPEN 状态机）=====
+CB_ENABLED = True                            # 熔断总开关
+CB_FAILURE_THRESHOLD = 5                     # 连续失败 N 次打开熔断
+CB_COOLDOWN_SECONDS = 30                     # 熔断冷却时间（秒），之后放行 1 次试探
+
+# ===== 检索结果缓存配置（部署运维改造 P2）=====
+SEARCH_CACHE_ENABLED = True                  # 检索缓存总开关
+SEARCH_CACHE_TTL = 600                       # 缓存 TTL（秒），检索结果时效性
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")   # Redis 地址（分布式缓存）
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))   # Redis 端口
+
+# ===== 向量库服务化配置（部署运维改造 P2）=====
+# 空 = PersistentClient（本地目录，单机）；非空 = HttpClient（client-server，多实例共享）
+# 例：CHROMA_SERVER_URL = "http://localhost:8100"  # ⚠️ 用 8100 避开 api-server 占用的 8000（见 技术文档/启动指南.md）
+CHROMA_SERVER_URL = os.getenv("CHROMA_SERVER_URL", "")
+
+# ===== 限流配置（部署运维改造 P3）=====
+RATE_LIMIT_ENABLED = True
+# 用户请求级（api_server）：每个登录用户限流（防滥用/控成本）
+USER_RATE_LIMIT_CAPACITY = 60     # 令牌桶容量（允许突发 60 次）
+USER_RATE_LIMIT_REFILL = 1.0      # 每秒补充令牌数（= 60 次/分钟）
+# LLM 调用级（call_llm_with_cb）：对 DeepSeek 限流（配合供应商 RPM）
+LLM_RATE_LIMIT_CAPACITY = 30      # 令牌桶容量（允许突发 30 次）
+LLM_RATE_LIMIT_REFILL = 0.5       # 每秒补充令牌数（= 30 次/分钟）
+
+# ===== 工具鉴权配置（P4）=====
+TOOL_PERMISSION_ENABLED = True    # 工具级权限总开关（默认开；启动期校验兜底防漏配）
 
 # ===== Markdown 分块配置 =====
 CHUNK_MERGE_RATIO = 1 / 3         # 章节长度 < chunk_size 的 1/3 → 合并到相邻同级章节
@@ -194,7 +231,6 @@ MEMORY_EXTRACT_ENABLED = True             # 实体抽取开关（False=仅存对
 MEMORY_EXTRACT_MAX_TOKENS = 512           # 抽取 LLM max_tokens（推理模型需给足，否则 content 空）
 MEMORY_DECAY_DAYS = 90                    # 记忆时间衰减：超过此天数显著降权
 MEMORY_DEDUP_SIM = 0.85                   # 抽取去重相似度阈值（>此值视为同一记忆，更新而非新增）
-MEMORY_USER_CONTEXT_FILE = "memory_user_context.json"  # 跨进程用户身份传递
 # 记忆类型权重（注入排序用）：用户画像 > 项目实体 > 历史结论
 MEMORY_TYPE_WEIGHTS = {"profile": 1.0, "entity": 0.7, "conclusion": 0.4}
 

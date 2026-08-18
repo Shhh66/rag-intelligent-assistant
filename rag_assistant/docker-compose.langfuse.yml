@@ -1,0 +1,45 @@
+# LangFuse 自托管 —— 全链路可观测（数据卷指向 D 盘，遵守项目环境约定）
+#
+# 启动：  docker compose -f docker-compose.langfuse.yml up -d
+# 访问：  http://localhost:3000  （首次注册账号 → 创建 project → 拿 pk/sk 填入 .env）
+# 停止：  docker compose -f docker-compose.langfuse.yml down
+#
+# .env 需配置：
+#   LANGFUSE_PUBLIC_KEY=pk-lf-...
+#   LANGFUSE_SECRET_KEY=sk-lf-...
+#   LANGFUSE_HOST=http://localhost:3000
+# 并在 config.py 设 LANGFUSE_ENABLED=True
+
+services:
+  langfuse-db:
+    image: postgres:16
+    restart: always
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse
+      POSTGRES_DB: langfuse
+    volumes:
+      # 数据落 D 盘，避免占用 C 盘
+      - D:/VsCode/AI/.cache/langfuse_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  langfuse:
+    image: langfuse/langfuse:2
+    restart: always
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
+      NEXTAUTH_SECRET: change-me-to-a-random-secret
+      SALT: change-me-to-a-random-salt
+      NEXTAUTH_URL: http://localhost:3000
+      TELEMETRY_ENABLED: "false"
+      # 个人本地使用，允许直接注册
+      AUTH_DISABLE_SIGNUP: "false"

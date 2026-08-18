@@ -92,11 +92,18 @@ def _fetch_all_chunks():
 
 
 def _compute_signature(docs) -> str:
-    """知识库签名：chunk 数 + 各 chunk 前 64 字的 MD5。内容变则签名变。"""
+    """知识库签名：chunk 数 + 内容前 64 字 + 权限元数据的 MD5。
+
+    纳入 kb_group/visibility：权限变更（内容不变）时签名也变，
+    驱动 BM25 索引重建，避免用旧 metadata 做权限过滤（两通道不一致）。
+    """
     h = hashlib.md5()
     h.update(str(len(docs)).encode())
     for d in docs:
         h.update((d.page_content[:64]).encode("utf-8", errors="ignore"))
+        m = d.metadata or {}
+        h.update(str(m.get("kb_group", "")).encode("utf-8", errors="ignore"))
+        h.update(str(m.get("visibility", "")).encode("utf-8", errors="ignore"))
     return h.hexdigest()
 
 
@@ -176,8 +183,25 @@ def _ensure_index():
 # ─────────────────────────────────────────────
 # 对外检索接口
 # ─────────────────────────────────────────────
-def search_bm25(query: str, top_k: int = None):
-    """BM25 关键词检索，返回 list[Document]（降序）。失败/空库返回 []。"""
+def _filter_by_permission(docs, kb_groups):
+    """按 kb_groups 过滤文档，对齐 vector_store.search_with_permission 的 where 语义。
+
+    kb_groups=[]    → 仅 public 文档
+    kb_groups=[...] → 组内文档 + public 文档
+    """
+    def allowed(d):
+        m = d.metadata or {}
+        if m.get("visibility") == "public":
+            return True
+        return bool(kb_groups) and m.get("kb_group") in kb_groups
+    return [d for d in docs if allowed(d)]
+
+
+def search_bm25(query: str, top_k: int = None, kb_groups: list = None):
+    """BM25 关键词检索，返回 list[Document]（降序）。失败/空库返回 []。
+
+    kb_groups：权限分组（None=不限权限/不过滤，兼容旧行为）。
+    """
     top_k = top_k or BM25_TOP_K
     try:
         bm25, docs = _ensure_index()
@@ -188,7 +212,11 @@ def search_bm25(query: str, top_k: int = None):
             return []
         scores = bm25.get_scores(q_tokens)
         ranked = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
-        results = [d for d, s in ranked[:top_k] if s > 0]
+        results = [d for d, s in ranked if s > 0]
+        # 权限过滤（在 top_k 截断前，否则过滤后数量不足）
+        if kb_groups is not None:
+            results = _filter_by_permission(results, kb_groups)
+        results = results[:top_k]
         _log(f"'{query[:20]}' → {len(results)} 条")
         return results
     except Exception as e:

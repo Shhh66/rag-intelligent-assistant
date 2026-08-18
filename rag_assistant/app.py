@@ -13,7 +13,9 @@ from agent import Agent
 from evaluation import EvaluationLogger
 from token_tracker import get_tracker
 import requests as _requests
-from retriever import set_current_kb_groups, set_current_user
+
+# 权限后端地址：容器内走 api-server 服务名，本地开发默认 localhost:8000
+API_SERVER_URL = os.getenv("API_SERVER_URL", "http://localhost:8000")
 
 # ===== 页面设置 =====
 st.set_page_config(
@@ -63,6 +65,10 @@ with st.sidebar:
                                       help="public=全员可见, internal=仅本组可见")
 
     if uploaded_file and st.button("🚀 执行", use_container_width=True):
+        # 文档上传守卫（fail-closed）：未登录不允许上传，堵死「未授权写」口子
+        if "auth_token" not in st.session_state:
+            st.warning("🔒 请先在左侧「账户」区域登录后再上传文档。")
+            st.stop()
         save_dir = "uploaded_docs"
         os.makedirs(save_dir, exist_ok=True)
 
@@ -137,7 +143,7 @@ with st.sidebar:
         if st.button("🚀 登录", use_container_width=True):
             try:
                 resp = _requests.post(
-                    "http://localhost:8000/api/auth/login",
+                    f"{API_SERVER_URL}/api/auth/login",
                     json={"username": username, "password": password},
                     timeout=5,
                 )
@@ -148,8 +154,9 @@ with st.sidebar:
                     kb_groups = data["user"].get("kb_groups", [])
                     if not kb_groups:
                         kb_groups = None
-                    set_current_kb_groups(kb_groups)
-                    set_current_user(data["user"].get("username", "default"))
+                    st.session_state["kb_groups"] = kb_groups  # 存会话态，chat 时注入
+                    st.session_state["user_id"] = data["user"].get("username", "default")
+                    st.session_state["permissions"] = data["user"].get("permissions", [])  # 工具权限
                     st.rerun()
                 else:
                     st.error(f"登录失败: {resp.json().get('detail', '未知错误')}")
@@ -168,10 +175,8 @@ with st.sidebar:
         else:
             st.caption("可访问知识库: 全部（管理员）")
         if st.button("🚪 退出登录", use_container_width=True):
-            for k in ["auth_token", "auth_user"]:
+            for k in ["auth_token", "auth_user", "kb_groups", "user_id"]:
                 st.session_state.pop(k, None)
-            set_current_kb_groups(None)
-            set_current_user("default")
             st.rerun()
 
     # ── 知识库状态 ──
@@ -247,6 +252,15 @@ for msg in st.session_state.history:
 user_input = st.chat_input("输入你的问题...")
 
 if user_input:
+    # 登录守卫（fail-closed）：未登录不允许检索，堵死越权口子
+    if "auth_token" not in st.session_state:
+        # 先渲染 user 消息，避免用户困惑「我打的话去哪了」
+        with st.chat_message("user"):
+            st.write(user_input)
+        with st.chat_message("assistant"):
+            st.warning("🔒 请先在左侧「账户」区域登录后再提问。未登录无法检索知识库。")
+        st.stop()  # 停止执行，未登录输入不计入历史、不调用 Agent
+
     # 显示用户消息
     with st.chat_message("user"):
         st.write(user_input)
@@ -258,7 +272,12 @@ if user_input:
 
         try:
             # 统一走 agent.chat()，内部自动处理有/无知识库的情况
-            answer = st.session_state.agent.chat(user_input)
+            # 从登录态注入请求级权限分组 + 用户身份（全程参数透传，无文件共享）
+            kb_groups = st.session_state.get("kb_groups")
+            user_id = st.session_state.get("user_id", "default")
+            permissions = st.session_state.get("permissions")
+            answer = st.session_state.agent.chat(user_input, kb_groups=kb_groups,
+                                                 user_id=user_id, permissions=permissions)
 
             # 显示回答
             st.write(answer)

@@ -9,6 +9,8 @@ import logging
 
 from mcp import ClientSession
 
+from .circuit_breaker import CircuitBreakerError, get_breaker
+
 logger = logging.getLogger(__name__)
 
 
@@ -24,6 +26,17 @@ def _retry_config():
         )
     except Exception:
         return True, 3, 0.5, 8.0
+
+
+def _get_breaker_or_none():
+    """读取熔断器（CB_ENABLED=False 时返回 None=不启用，安全降级）。"""
+    try:
+        import config
+        if getattr(config, "CB_ENABLED", True):
+            return get_breaker()
+    except Exception:
+        pass
+    return None
 
 
 class MCPConnectionError(Exception):
@@ -75,12 +88,24 @@ class MCPSession:
         return self._tools_cache
 
     async def call_tool(self, name: str, arguments: dict):
-        """调用 MCP 工具（带超时 + 统一指数退避重试）。
+        """调用 MCP 工具（带熔断 + 超时 + 统一指数退避重试）。
 
-        只重试瞬时故障（超时/连接错误）；工具业务错误(isError)由上层判断，不在此重试。
-        重试全部失败后抛出最后一次异常，保持调用方原有 except 兜底不变。
+        熔断器（职责 = MCP 通道可用性）：连续失败达阈值 → 打开熔断，冷却期内直接拒绝，
+        防雪崩。它保护的是「MCP 子进程通道」（超时/崩溃），不是下游业务——
+        DeepSeek 故障由子进程内 per-destination 熔断器负责（见 circuit_breaker.py）。
+        重试：只重试瞬时故障（超时/连接错误）；工具业务错误(isError)由上层判断，不在此重试。
         """
         enabled, max_attempts, backoff_base, max_wait = _retry_config()
+        breaker = _get_breaker_or_none()
+
+        # 熔断检查：OPEN 且未冷却 → 直接拒绝，不调用下游
+        if breaker is not None and not breaker.allow_request():
+            raise CircuitBreakerError(
+                f"熔断打开，工具 {name} 调用被拒绝（MCP 通道持续故障，冷却中）"
+            )
+
+        # 瞬时故障类型（重试 + 熔断都针对它们）
+        transient = (ToolCallTimeoutError, ConnectionError, TimeoutError, OSError)
 
         async def _once():
             try:
@@ -93,29 +118,40 @@ class MCPSession:
             except asyncio.TimeoutError:
                 raise ToolCallTimeoutError(f"工具 {name} 超时 ({self.call_timeout}s)")
 
-        if not enabled or max_attempts <= 1:
-            return await _once()
-
-        # 只对瞬时错误重试：超时、连接类异常
-        from tenacity import (
-            AsyncRetrying, stop_after_attempt, wait_exponential,
-            retry_if_exception_type, RetryError,
-        )
-        transient = (ToolCallTimeoutError, ConnectionError, TimeoutError, OSError)
         try:
-            async for attempt in AsyncRetrying(
-                stop=stop_after_attempt(max_attempts),
-                wait=wait_exponential(multiplier=backoff_base, max=max_wait),
-                retry=retry_if_exception_type(transient),
-                reraise=True,
-            ):
-                with attempt:
-                    n = attempt.retry_state.attempt_number
-                    if n > 1:
-                        logger.warning(f"工具 {name} 第 {n}/{max_attempts} 次重试")
-                    return await _once()
-        except RetryError as e:  # reraise=True 下一般不会走到，兜底
-            raise e.last_attempt.exception()
+            if not enabled or max_attempts <= 1:
+                result = await _once()
+            else:
+                # 只对瞬时错误重试：超时、连接类异常
+                from tenacity import (
+                    AsyncRetrying, stop_after_attempt, wait_exponential,
+                    retry_if_exception_type, RetryError,
+                )
+                try:
+                    async for attempt in AsyncRetrying(
+                        stop=stop_after_attempt(max_attempts),
+                        wait=wait_exponential(multiplier=backoff_base, max=max_wait),
+                        retry=retry_if_exception_type(transient),
+                        reraise=True,
+                    ):
+                        with attempt:
+                            n = attempt.retry_state.attempt_number
+                            if n > 1:
+                                logger.warning(f"工具 {name} 第 {n}/{max_attempts} 次重试")
+                            result = await _once()
+                except RetryError as e:  # reraise=True 下一般不会走到，兜底
+                    raise e.last_attempt.exception()
+        except transient:
+            # 瞬时故障重试后仍失败 → 熔断器记一次失败（下游可能持续故障）
+            if breaker is not None:
+                breaker.record_failure()
+                logger.warning(f"熔断器记录失败: {name} (state={breaker.status()})")
+            raise
+
+        # 成功 → 熔断器复位（下游恢复正常）
+        if breaker is not None:
+            breaker.record_success()
+        return result
 
     async def refresh_tools(self) -> list:
         """强制刷新工具列表。"""

@@ -14,8 +14,6 @@ from typing import Literal
 
 from openai import OpenAI
 
-from token_tracker import get_tracker
-
 from .prompt_templates import (
     build_decision_prompt,
     build_final_answer_prompt,
@@ -23,6 +21,7 @@ from .prompt_templates import (
 )
 from .tool_registry import ToolMeta
 from .skill_registry import SkillRegistry
+from .circuit_breaker import call_llm_with_cb, CircuitBreakerError
 
 logger = logging.getLogger(__name__)
 
@@ -105,17 +104,16 @@ class DecisionEngine:
         messages.append({"role": "user", "content": prompt})
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=0.1,
-                max_tokens=4000,
+            response = call_llm_with_cb(
+                self.client, self.model, messages,
+                temperature=0.1, max_tokens=4000, call_site="decision_engine.decide",
             )
             raw_text = response.choices[0].message.content or ""
-            get_tracker().record(self.model, response.usage, call_site="decision_engine.decide")
             logger.debug(f"LLM 决策原始输出: {raw_text[:300]}")
             return self._parse_decision(raw_text)
 
+        except CircuitBreakerError:
+            raise  # 熔断打开：快速失败，冒泡到 unified_agent 入口
         except Exception as e:
             logger.error(f"LLM 决策调用失败: {e}")
             # 降级：直接回答
@@ -150,15 +148,14 @@ class DecisionEngine:
         ]
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=0.3,
-                max_tokens=4000,
+            response = call_llm_with_cb(
+                self.client, self.model, messages,
+                temperature=0.3, max_tokens=4000, call_site="decision_engine.final_answer",
             )
             content = response.choices[0].message.content or "（无回答）"
-            get_tracker().record(self.model, response.usage, call_site="decision_engine.final_answer")
             return content
+        except CircuitBreakerError:
+            raise
         except Exception as e:
             logger.error(f"最终回答生成失败: {e}")
             return f"抱歉，生成最终回答时出现错误: {e}"
@@ -274,15 +271,11 @@ class DecisionEngine:
 
         for attempt in range(2):  # 解析失败允许重试 1 次
             try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    temperature=0.1,
-                    max_tokens=4000,
+                response = call_llm_with_cb(
+                    self.client, self.model, messages,
+                    temperature=0.1, max_tokens=4000, call_site="decision_engine.match_skill",
                 )
                 raw_text = response.choices[0].message.content or ""
-                get_tracker().record(self.model, response.usage,
-                                     call_site="decision_engine.match_skill")
                 logger.debug(f"Skill 确认原始输出: {raw_text[:200]}")
                 result = self._parse_skill_result(raw_text)
                 if result is not None:
@@ -296,6 +289,8 @@ class DecisionEngine:
                         "role": "user",
                         "content": "格式错误，请严格按照 SKILL: <技能名>\\n参数: ```json {...}``` 格式输出"
                     })
+            except CircuitBreakerError:
+                raise
             except Exception as e:
                 logger.error(f"Skill 匹配 LLM 调用失败: {e}")
                 break
@@ -385,15 +380,11 @@ class DecisionEngine:
 
         for attempt in range(2):
             try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    temperature=0.1,
-                    max_tokens=4000,
+                response = call_llm_with_cb(
+                    self.client, self.model, messages,
+                    temperature=0.1, max_tokens=4000, call_site="decision_engine.decide",
                 )
                 raw_text = response.choices[0].message.content or ""
-                get_tracker().record(self.model, response.usage,
-                                     call_site="decision_engine.decide")
                 logger.debug(f"ReAct 决策原始输出: {raw_text[:300]}")
                 decision = self._parse_react_output(raw_text)
                 if decision is not None:
@@ -406,6 +397,8 @@ class DecisionEngine:
                         "role": "user",
                         "content": "格式有误。请按指定格式输出：SKILL/Thought→Action/Final Answer。"
                     })
+            except CircuitBreakerError:
+                raise
             except Exception as e:
                 logger.error(f"ReAct 决策调用失败: {e}")
                 break

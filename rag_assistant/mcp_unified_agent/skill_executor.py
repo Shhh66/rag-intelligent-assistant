@@ -39,12 +39,16 @@ class SkillExecutor:
         skill_timeout: float = DEFAULT_SKILL_TIMEOUT,
         depth: int = 0,
         trace_id: str = "",
+        registry=None,
+        permissions: list = None,
     ):
         self.mcp = mcp_session
         self.step_timeout = step_timeout
         self.skill_timeout = skill_timeout
         self.depth = depth
         self.trace_id = trace_id
+        self.registry = registry  # ToolRegistry，用于工具鉴权查 required_perms
+        self.permissions = permissions  # 请求级工具权限（None=不限，不校验）
         self._logs: list[dict] = []
 
     # ── 主入口 ────────────────────────────────────────────────
@@ -183,6 +187,14 @@ class SkillExecutor:
         # 填充参数占位符 {city} → args["city"]
         filled_args = self._fill_args(step_args, args)
 
+        # 工具级权限校验（Skill 路径收口，与 scheduler 一致）
+        if self.permissions is not None and self.registry is not None:
+            denied = self._check_tool_permission(tool_name)
+            if denied:
+                self._log("perm_denied", f"步骤 {index}: {tool_name} 权限拒绝: 缺 {denied}")
+                return self._error_result(tool_name, filled_args, is_critical,
+                                          f"权限拒绝: 缺少 {denied} 权限")
+
         start = time.time()
         max_retries = 2 if is_retryable else 1
 
@@ -284,7 +296,7 @@ class SkillExecutor:
         """用 LLM 对工具结果进行后置加工（如穿衣建议）。"""
         from openai import OpenAI
         from config import GROQ_API_KEY, GROQ_BASE_URL, LLM_MODEL
-        from token_tracker import get_tracker
+        from .circuit_breaker import call_llm_with_cb
 
         # 拼接原始结果
         result_parts = []
@@ -297,14 +309,10 @@ class SkillExecutor:
         prompt = prompt.replace("{results}", raw_results)
 
         client = OpenAI(api_key=GROQ_API_KEY, base_url=GROQ_BASE_URL, timeout=30.0)
-        response = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.5,
-            max_tokens=4000,
+        response = call_llm_with_cb(
+            client, LLM_MODEL, [{"role": "user", "content": prompt}],
+            temperature=0.5, max_tokens=4000, call_site="skill_executor.post_process",
         )
-
-        get_tracker().record(LLM_MODEL, response.usage, call_site="skill_executor.post_process")
         return response.choices[0].message.content or "（无法生成建议）"
 
     async def _default_summarize(
@@ -317,7 +325,7 @@ class SkillExecutor:
         """
         from openai import OpenAI
         from config import GROQ_API_KEY, GROQ_BASE_URL, LLM_MODEL
-        from token_tracker import get_tracker
+        from .circuit_breaker import call_llm_with_cb
 
         # 拼接成功结果
         parts = []
@@ -351,18 +359,26 @@ class SkillExecutor:
             )
 
         client = OpenAI(api_key=GROQ_API_KEY, base_url=GROQ_BASE_URL, timeout=30.0)
-        response = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.5,
-            max_tokens=4000,
+        response = call_llm_with_cb(
+            client, LLM_MODEL, [{"role": "user", "content": prompt}],
+            temperature=0.5, max_tokens=4000, call_site="skill_executor.default_summarize",
         )
-
-        get_tracker().record(LLM_MODEL, response.usage,
-                             call_site="skill_executor.default_summarize")
         return response.choices[0].message.content or "（无法生成回答）"
 
     # ── 工具方法 ──────────────────────────────────────────────
+
+    def _check_tool_permission(self, tool_name: str) -> str | None:
+        """工具级权限校验（与 scheduler._check_tool_permission 逻辑一致）。"""
+        if self.registry is None:
+            return None
+        meta = self.registry.get(tool_name)
+        if meta is None:
+            return "（工具未注册）"
+        required = meta.required_perms or ["*"]
+        if required == ["*"]:
+            return None
+        missing = [p for p in required if p not in (self.permissions or [])]
+        return missing[0] if missing else None
 
     def _error_result(self, tool: str, args: dict, critical: bool, msg: str) -> dict:
         self._audit(tool, args, "", False, 0.0, 0, error=msg)

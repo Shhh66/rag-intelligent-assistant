@@ -1,0 +1,93 @@
+# RAG 智能助手多服务编排 —— 权限后端 + 主服务 + 嵌入服务 + 重排服务
+#
+# 启动：docker compose up -d
+# 停止：docker compose down
+# 前提：先 docker build -t rag-assistant . 构建镜像
+#
+# 数据卷均指向 D 盘（遵守项目环境约定，不占用 C 盘）：
+#   - HF 模型缓存：D:/VsCode/AI/.cache/huggingface（模型只下载一次，多服务共享）
+#   - ChromaDB 向量库：宿主机 chroma_db/（主服务读写）
+#
+# 架构：
+#   api-server (:8000)  ← 权限后端（JWT + SQLite），main 登录依赖
+#   main (Streamlit :8501)
+#     └─ mcp_server (stdio 子进程)
+#          ├─ HTTP → embed-server (:8001)
+#          └─ HTTP → rerank-server (:8002)
+
+services:
+  api-server:
+    image: rag-assistant
+    command: uvicorn api_server:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./permission.db:/app/permission.db   # 权限数据库（用户/角色/分组）
+      - ./.env:/app/.env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/openapi.json')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  embed-server:
+    image: rag-assistant
+    command: python embed_server.py
+    ports:
+      - "8001:8001"
+    volumes:
+      - D:/VsCode/AI/.cache/huggingface:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/ready')"]
+      interval: 10s
+      timeout: 5s
+      retries: 30   # 模型加载 420MB，冷启动需时间，重试次数给足
+      start_period: 10s
+    restart: unless-stopped
+
+  rerank-server:
+    image: rag-assistant
+    command: python rerank_server.py
+    ports:
+      - "8002:8002"
+    volumes:
+      - D:/VsCode/AI/.cache/huggingface:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/ready')"]
+      interval: 10s
+      timeout: 5s
+      retries: 30   # 重排模型 568MB，加载更慢
+      start_period: 15s
+    restart: unless-stopped
+
+  main:
+    image: rag-assistant
+    command: streamlit run app.py --server.address 0.0.0.0 --server.port 8501
+    ports:
+      - "8501:8501"
+    environment:
+      # 主服务不再本地加载模型，走独立模型服务
+      EMBED_SERVER_URL: http://embed-server:8001
+      RERANK_SERVER_URL: http://rerank-server:8002
+      API_SERVER_URL: http://api-server:8000   # 登录走容器内权限后端，替换硬编码 localhost:8000
+    volumes:
+      - D:/VsCode/AI/.cache/huggingface:/root/.cache/huggingface
+      # ChromaDB 向量库 + 上传文档 落宿主机（数据持久化）
+      - ./chroma_db:/app/chroma_db
+      - ./uploaded_docs:/app/uploaded_docs
+      - ./.env:/app/.env
+    depends_on:
+      api-server:
+        condition: service_healthy
+      embed-server:
+        condition: service_healthy
+      rerank-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped

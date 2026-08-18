@@ -26,6 +26,8 @@ from mcp.client.stdio import stdio_client
 from mcp import ClientSession, StdioServerParameters
 
 from .mcp_client_manager import MCPSession
+from .circuit_breaker import CircuitBreakerError
+from rate_limiter import RateLimitError
 from .tool_registry import ToolRegistry
 from .decision_engine import DecisionEngine, SkillMatchResult
 from .scheduler import Scheduler
@@ -91,6 +93,7 @@ class UnifiedAgent:
         self._history: list[dict] = []       # 对话历史
         self._reflection: ReflectionMemory | None = None  # 反思记忆
         self._skill_registry: SkillRegistry | None = None  # Skill 注册表
+        self._user_id: str = "default"       # 当前用户身份（长期记忆隔离，请求级，不再读文件）
 
         # 工具向量索引（懒加载，首次 chat() 时构建并缓存）
         self._tool_filter: ToolVectorFilter | None = None
@@ -139,23 +142,39 @@ class UnifiedAgent:
 
     # ── 同步入口 ──────────────────────────────────────────────
 
-    def chat(self, user_input: str) -> str:
+    def chat(self, user_input: str, kb_groups: list = None, user_id: str = None,
+             permissions: list = None) -> str:
         """同步入口：兼容 Streamlit 等同步框架。
 
         每次调用完成完整的 MCP 连接 → 流水线 → 断开周期。
+        kb_groups：请求级权限分组，注入知识库工具（None=不限权限）。
+        user_id：当前用户身份，供长期记忆隔离（None=回落 default，不残留上次身份）。
+        permissions：请求级工具权限（None=不限，不校验工具鉴权）。
         """
         if not user_input or not user_input.strip():
             return "请输入您的问题。"
 
+        # 每次调用都显式设置，None 回落 default（避免残留上一个用户身份）
+        self._user_id = user_id or "default"
+
         try:
-            return asyncio.run(self._run(user_input))
+            return asyncio.run(self._run(user_input, kb_groups, permissions))
+        except CircuitBreakerError as e:
+            # 熔断打开：下游模型持续故障，快速失败，不再进入 ReAct 循环反复重试
+            logger.warning(f"下游模型熔断: {e}")
+            return "下游模型服务暂时不可用（熔断保护中），请稍后重试。"
+        except RateLimitError as e:
+            # LLM 调用限流：频率超限，快速失败（日志带当前用户，便于排查是谁触发）
+            logger.warning(f"LLM 调用限流 (user={self._user_id}): {e}")
+            return "请求过于频繁，请稍后重试。"
         except Exception as e:
             logger.error(f"chat 异常: {type(e).__name__}: {e}", exc_info=True)
             return f"处理请求时出现错误: {type(e).__name__}: {e}"
 
     # ── 主流程 ────────────────────────────────────────────────
 
-    async def _run(self, user_input: str) -> str:
+    async def _run(self, user_input: str, kb_groups: list = None,
+                   permissions: list = None) -> str:
         """完整的一次对话流程。
 
         直接在方法内使用 async with 管理 stdio 子进程，
@@ -205,7 +224,9 @@ class UnifiedAgent:
 
                 # 3. 执行流水线
                 decision_engine = DecisionEngine(self._llm_client, self.model)
-                scheduler = Scheduler(mcp, tool_registry, self.call_timeout, trace_id=trace_id)
+                scheduler = Scheduler(mcp, tool_registry, self.call_timeout,
+                                      trace_id=trace_id, kb_groups=kb_groups,
+                                      permissions=permissions)
 
                 answer = await self._pipeline(
                     user_input=user_input,
@@ -328,6 +349,8 @@ class UnifiedAgent:
                                 mcp_session,
                                 step_timeout=self.call_timeout,
                                 trace_id=scheduler.trace_id,
+                                registry=tool_registry,
+                                permissions=scheduler.permissions,
                             )
                             answer = await executor.execute(
                                 skill, skill_result.args
@@ -408,6 +431,20 @@ class UnifiedAgent:
                 f"mode={decision.execution_mode}"
             )
 
+            # 思考留痕：记录本轮 ReAct 决策（合规「每一步思考可回溯」）
+            try:
+                from tool_audit import log_decision
+                log_decision(
+                    trace_id=scheduler.trace_id,
+                    turn=turn,
+                    action=decision.action,
+                    thought=(decision.tools[0].reason if decision.tools else ""),
+                    tool_names=[t.tool_name for t in decision.tools],
+                    skill_name=decision.skill_name,
+                )
+            except Exception:
+                pass
+
             # 4. 直接回答 → 返回
             if decision.action == "direct_answer":
                 answer = decision.direct_response or "（无法生成回答）"
@@ -419,7 +456,8 @@ class UnifiedAgent:
                 skill = self._skill_registry.get(decision.skill_name) if self._skill_registry else None
                 if skill:
                     try:
-                        executor = SkillExecutor(mcp_session, step_timeout=self.call_timeout, trace_id=scheduler.trace_id)
+                        executor = SkillExecutor(mcp_session, step_timeout=self.call_timeout, trace_id=scheduler.trace_id,
+                                                 registry=tool_registry, permissions=scheduler.permissions)
                         answer = await executor.execute(skill, decision.skill_args)
                         self._record_conversation(user_input, answer)
                         return answer
@@ -512,12 +550,8 @@ class UnifiedAgent:
                 pass
 
     def _current_user_id(self) -> str:
-        """读取当前登录用户名（跨进程共享文件），供长期记忆隔离。"""
-        try:
-            from retriever import get_current_user
-            return get_current_user()
-        except Exception:
-            return "default"
+        """返回当前用户身份（请求级，由 chat(user_id=...) 设置，不再读文件）。"""
+        return self._user_id
 
     def _maybe_sediment_preference(self, threshold: int = 3) -> None:
         """短→长沉淀：某工具在反思记忆里成功使用达到阈值 → 沉淀为用户偏好。

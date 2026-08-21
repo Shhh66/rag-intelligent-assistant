@@ -48,18 +48,19 @@ def _rrf_fuse(vec_docs, bm25_docs, top_k):
     return [doc_map[k] for k, _ in ranked[:top_k]]
 
 
-def hybrid_search(query: str, top_k: int = None):
+def hybrid_search(query: str, top_k: int = None, kb_groups: list = None):
     """混合检索统一入口。
 
     返回 list[Document]。
     - HYBRID_ENABLED=False 或 BM25 无结果 → 退回纯向量检索。
     - 向量检索本身失败会向上抛（由调用方按原逻辑处理），保持与 search() 行为一致。
+    - kb_groups 透传给向量通道做权限过滤（None=不限权限，不过滤）。
     """
     top_k = top_k or TOP_K
     from vector_store import search  # 延迟导入，避免循环依赖
 
     # 向量通道（含权限过滤，复用现有 search）
-    vec_docs = search(query, top_k=max(VECTOR_TOP_K, top_k))
+    vec_docs = search(query, top_k=max(VECTOR_TOP_K, top_k), kb_groups=kb_groups)
 
     if not HYBRID_ENABLED:
         return vec_docs[:top_k]
@@ -67,7 +68,8 @@ def hybrid_search(query: str, top_k: int = None):
     # BM25 通道（安全降级：异常/空库返回 []）
     try:
         from bm25_index import search_bm25
-        bm25_docs = search_bm25(query, top_k=BM25_TOP_K)
+        # 同样透传 kb_groups，BM25 通道与向量通道权限一致（防跨组泄露）
+        bm25_docs = search_bm25(query, top_k=BM25_TOP_K, kb_groups=kb_groups)
     except Exception as e:
         _log(f"BM25 不可用，退回纯向量: {e}")
         bm25_docs = []

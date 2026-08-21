@@ -1,0 +1,67 @@
+[
+  {
+    "question": "6G低空无人机调研报告中，ISAC技术的核心理念是什么？",
+    "ground_truth": "ISAC（通信感知一体化）的核心理念在于通过统一的射频前端栈和公共的波形结构，同时支持高质量的通信传输与高精度的雷达感知功能，即共享同一段频谱资源与底层射频硬件架构，实现一物两用。",
+    "category": "simple_fact"
+  },
+  {
+    "question": "什么是ISCC？它协同优化哪三个维度？",
+    "ground_truth": "ISCC是通信、感知与控制一体化，是超越传统网络模块隔离设计的系统性全新范式。它通过感知、通信与控制三个维度的深度协同优化，建立紧密耦合的动态闭环。",
+    "category": "simple_fact"
+  },
+  {
+    "question": "LSS目标指的是什么样的目标？",
+    "ground_truth": "LSS目标指“低空、慢速、小目标”的无人机，其雷达散射截面（RCS）通常极其微小（通常小于2平方米），在复杂的城市背景杂波中极难被传统雷达区分和捕捉。",
+    "category": "simple_fact"
+  },
+  {
+    "question": "可重构智能表面RIS由什么组成？",
+    "ground_truth": "RIS由成百上千个可独立调节相位的超材料无源反射元件组成，能够用于物理层安全等场景。",
+    "category": "simple_fact"
+  },
+  {
+    "question": "姓名.pdf的表格里，小蓝的身高和体重分别是多少？",
+    "ground_truth": "小蓝的身高是160cm，体重是60kg。",
+    "category": "simple_fact"
+  },
+  {
+    "question": "低空无人机ISAC商业化面临哪些现有设计问题？请综合说明。",
+    "ground_truth": "主要问题包括：一是多径效应与“幽灵”目标挑战（城市峡谷环境严重多径导致虚假目标）；二是资源分配与感知能效SEE的极致权衡（机载电池受限，通信与感知争夺能量）；三是AI模型高算力需求与边缘部署的物理限制（大模型算力与无人机边缘平台冲突）；四是严格的航空监管与现实验证的巨大鸿沟（AI黑盒难认证、缺乏真实验证设施）。",
+    "category": "multi_hop"
+  },
+  {
+    "question": "为什么无人机需要通信感知一体化而不是用独立的雷达和通信系统？",
+    "ground_truth": "因为传统架构中雷达感知与通信系统运行在不同频段、使用独立射频链路和硬件模块，造成频谱浪费；且无人机在载荷重量、体积尺寸和电池能量方面存在物理限制，双重硬件叠加增加起飞重量、消耗能量。ISAC通过共享频谱和射频硬件实现一物两用，减轻无人机负担。",
+    "category": "multi_hop"
+  },
+  {
+    "question": "无人机低空信道建模为什么不能沿用传统二维静态平稳信道假设？",
+    "ground_truth": "因为无人机具有独特的空对地（A2G）和空对空（A2A）信道特征，低空传播环境高度动态，城市峡谷等复杂地形易导致严重的非视距（NLoS）传播和多径散射；无人机剧烈姿态变化（滚转、俯仰、偏航）及机身结构件（旋翼、机翼）会引发强烈阴影遮挡和非平稳信道的时空剧烈波动，因此必须摒弃二维静态平稳假设。",
+    "category": "multi_hop"
+  },
+  {
+    "question": "What is ISAC in the context of 6G UAV networks?",
+    "ground_truth": "ISAC (Integrated Sensing and Communication) is a core 6G technology that shares the same spectrum and underlying RF hardware to simultaneously support high-quality communication and high-precision radar sensing, allowing a UAV to transmit data while using reflected RF signals to locate targets and map terrain.",
+    "category": "cross_lingual"
+  },
+  {
+    "question": "How is micro-Doppler signature (MDS) used to detect small drones?",
+    "ground_truth": "By extracting the micro-Doppler signatures (MDS) produced by the rotation of drone rotors, combined with empirical mode decomposition (EMD) and machine learning classifiers such as SVM and CNN, low-altitude slow small (LSS) targets can be distinguished from complex urban clutter.",
+    "category": "cross_lingual"
+  },
+  {
+    "question": "What are the main challenges of physical layer security in ISAC systems?",
+    "ground_truth": "Because ISAC sensing signals inherently probe space and broadcast, communication and sensing are tightly coupled in the spatial domain, making them vulnerable to passive eavesdropping and active jamming by malicious eavesdroppers. Physical layer security (PLS) uses the intrinsic physical characteristics of wireless channels to protect data confidentiality, and reconfigurable intelligent surfaces (RIS) are introduced as a hot research direction.",
+    "category": "cross_lingual"
+  },
+  {
+    "question": "那个无人机报告里说的能量消耗问题到底是咋回事？",
+    "ground_truth": "指资源分配与感知能效（SEE）的权衡问题：商用无人机依靠受限的车载锂电池供电，维持克服重力飞行的机械能量远大于通信和感知的电子能量。若通信一味追求高带宽或感知盲目追求高刷新率，会引发不合理的绕路轨迹，导致飞行能效极差、缩短作业时间。",
+    "category": "fuzzy"
+  },
+  {
+    "question": "为啥这些AI飞控技术很难真正用起来？",
+    "ground_truth": "主要因为AI驱动的复杂飞行决策算法具有“黑盒”不可解释特性，难以通过航空管理局对生命关键系统的严格安全认证；且大量研究过度依赖理想化纯软件仿真，与真实物理空域部署存在巨大“验证鸿沟”，缺乏像瑞士LINA那样的大规模软硬件在环测试验证设施。",
+    "category": "fuzzy"
+  }
+]

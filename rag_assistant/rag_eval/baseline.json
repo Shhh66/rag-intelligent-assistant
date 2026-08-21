@@ -1,0 +1,9 @@
+{
+  "timestamp": "2026-07-11 15:57:41",
+  "overall": {
+    "context_recall": 1.0,
+    "context_precision": 0.960256410194658,
+    "faithfulness": 0.9371628371628371,
+    "answer_relevancy": 0.9016637957935655
+  }
+}

@@ -1,0 +1,21 @@
+# 不打包进镜像的内容（体积大或运行时生成）
+venv/
+__pycache__/
+*.pyc
+chroma_db/
+db_meta.json
+permission.db
+memory.db
+*.jsonl
+*.pkl
+formula_cache.json
+kb_permission_context.json
+memory_user_context.json
+.env
+frontend/node_modules/
+frontend/dist/
+uploaded_docs/
+.cache/
+.git/
+.gitignore
+*.md

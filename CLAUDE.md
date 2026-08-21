@@ -21,7 +21,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Skills 技能层**：声明式字典定义，关键词+向量双重匹配，失败无感降级 ReAct
 - **ReAct 推理层**：自研轻量引擎，LLM 自主 Thought→Action→Observation 循环，保留多工具并行
 
-**企业级能力**（部署运维改造 P0–P3 已落地）：模型服务化（embed/rerank 独立 HTTP 服务）、权限无状态透传、熔断器（per-destination）、限流（两层令牌桶）、检索缓存（Redis）、向量库服务化（Client/Server）、容器化（Docker 4 服务编排）、可观测（审计/LangFuse）、RAGAS 评测。详见 [企业级RAG架构.md](rag_assistant/技术文档/企业级RAG架构.md)。
+**企业级能力**（P0–P4 已落地）：模型服务化（embed/rerank 独立 HTTP 服务）、权限无状态透传、MCP 工具鉴权、熔断器（per-destination）、限流（两层令牌桶）、检索缓存（Redis）、向量库服务化（Client/Server）、容器化（Docker 4 服务编排）、可观测（审计/LangFuse/思考留痕）、评测（RAGAS + Agent 端到端）。详见 [企业级RAG架构.md](rag_assistant/技术文档/企业级RAG架构.md)。
 
 ## 常用命令
 
@@ -67,6 +67,7 @@ python rag_eval/run_eval.py --config both            # 完整 A/B 评测(基线 
 python rag_eval/run_eval.py --config both --limit 2  # 小样本快跑(省 Token,先验证链路)
 python rag_eval/run_eval.py --config both --save-baseline  # 并保存基线快照
 python rag_eval/adapters.py                          # 自测 RAGAS 适配器(LLM/嵌入包装)
+python agent_eval.py --report                        # Agent 端到端评测(工具调用成功率+端到端延迟)
 
 # === 可观测性 (LangFuse 自托管，可选) ===
 docker compose -f rag_assistant/docker-compose.langfuse.yml up -d   # 起 LangFuse → http://localhost:3000
@@ -148,6 +149,7 @@ Redis(缓存+限流)  embed_server   rerank_server
 | `search_cache.py` | **Redis 检索缓存**：key=md5(query+排序 kb_groups)，TTL 自动过期，权限维度进 key 防串台 |
 | `rate_limiter.py` | **Redis 令牌桶限流**：两层（用户级 `rate:user` + LLM 级 `rate:llm`），Lua 原子操作，fail-open |
 | `rag_eval/` | **RAGAS 评测体系**：A/B 对比、4 指标量化、分层 + Bad Case + 成本报告 |
+| `agent_eval.py` | **Agent 端到端评测**：读 `tool_audit.jsonl` 聚合工具调用成功率 + 端到端延迟，零成本轻量报告 |
 | `config.py` | 全局配置：LLM/嵌入/重排/权限/熔断/限流/缓存/PDF 阈值/公式等所有配置项 |
 
 ## 关键设计决策
@@ -192,3 +194,4 @@ Redis(缓存+限流)  embed_server   rerank_server
 - **长期记忆按用户隔离**：`chat(user_id=...)` → `self._user_id` 实例属性(请求级，无文件共享)，`long_term_memory` 按 user_id 过滤。独立于 `clear_memory()`(清会话不清长期记忆)
 - **长期记忆检索用距离分**：本地嵌入的 `similarity_search_with_relevance_scores` 会返回负值，改用 `similarity_search_with_score` 距离分转 `1/(1+dist)`；抽取 LLM 调用 `max_tokens≥512`
 - **Redis 依赖**：检索缓存 + 限流都依赖 Redis，缺失时降级关闭（缓存跳过、限流放行），绝不阻断主链路
+- **Agent 端到端评测口径**：`agent_eval.py` 的「端到端延迟」是近似值（`tool_audit` 记录的是事件时间点而非区间，取同 trace 首末事件跨度，不含 LLM 首尾推理时间）；工具调用样本 < 30 条时聚合结果无统计意义

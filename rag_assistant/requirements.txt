@@ -7,8 +7,34 @@ langchain-core>=1.4
 langchain-chroma>=1.1
 langchain-huggingface>=1.2
 sentence-transformers>=5.5
-docx2txt>=0.9
+python-docx>=1.1
 pypdf>=6.12
 jsonschema>=4.26
 numpy>=2.4
 python-dotenv>=1.0
+tiktoken>=0.7
+PyMuPDF>=1.25
+filelock>=3.16
+# ===== RAG 评测体系(RAGAS)=====
+ragas>=0.4
+langchain-openai>=0.2
+datasets>=3.0
+# ===== 混合检索(BM25 关键词通道)=====
+rank_bm25>=0.2
+jieba>=0.42
+# ===== MCP 工程化 + 可观测性 =====
+tenacity>=8            # 工具调用统一重试+指数退避
+langfuse>=4            # 全链路可观测(自托管)
+# 注意：langfuse 会拉高 protobuf，但 paddlepaddle 2.6.2 要求 protobuf<=3.20.2，
+# 安装后须 `pip install "protobuf<=3.20.2"` 回退，二者共存(langfuse 走 HTTP，不受影响)
+
+# ===== 权限后端 + 模型服务化（部署运维改造 P0/P1）=====
+fastapi>=0.115         # api_server / embed_server / rerank_server
+uvicorn[standard]>=0.30  # 服务启动
+pydantic>=2.7          # FastAPI 数据模型
+PyJWT>=2.8             # api_server JWT 鉴权
+transformers>=4.44     # reranker / rerank_server（BGE-Reranker）
+torch>=2.2             # 重排推理（CPU 版即可）
+
+# ===== 检索缓存（部署运维改造 P2）=====
+redis>=5.0             # 检索结果缓存（Redis 分布式缓存，search_cache.py）

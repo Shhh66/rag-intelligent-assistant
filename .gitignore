@@ -7,12 +7,18 @@ venv/
 # 向量数据库（运行时生成）
 chroma_db/
 
+# 长期记忆存储（运行时生成）
+memory.db
+memory_user_context.json
+
 # Python 缓存
 __pycache__/
 *.pyc
 
 # 运行日志
 qa_log.jsonl
+tool_audit.jsonl
+token_log.jsonl
 
 # 用户上传的文档
 uploaded_docs/

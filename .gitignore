@@ -30,3 +30,19 @@ uploaded_docs/
 
 # 密钥文件
 .env
+
+# 运行产物与缓存（运行时生成，不提交）
+permission.db
+bm25_index.pkl
+bm25_stopwords.txt
+formula_cache.json
+kb_permission_context.json
+agent_eval_report.md
+.cache/
+reports/
+
+# 误创建文件
+=1.25
+
+# 敏感文件
+教务加密.txt

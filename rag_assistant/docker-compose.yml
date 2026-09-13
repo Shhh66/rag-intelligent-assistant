@@ -16,14 +16,41 @@
 #          └─ HTTP → rerank-server (:8002)
 
 services:
+  # ── 基础设施：Redis（检索缓存 + 限流令牌桶）──
+  # 不纳入编排时主链路会「降级关闭」而非报错（缓存跳过、限流放行），
+  # 容易被误以为已生效 —— 故默认启动。
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - D:/VsCode/AI/.cache/redis:/data    # 落 D 盘，遵守项目环境约定
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
   api-server:
     image: rag-assistant
     command: uvicorn api_server:app --host 0.0.0.0 --port 8000
     ports:
       - "8000:8000"
+    environment:
+      # ⚠️ 必须显式注入：config 默认 localhost:6379，容器内连不到 → 限流器单例
+      # 初始化失败后会永久保持「降级放行」，直到进程重启
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # 运行产物统一目录（权限数据库 → 持久化）
+      RUNTIME_DATA_DIR: /app/runtime_data
     volumes:
-      - ./permission.db:/app/permission.db   # 权限数据库（用户/角色/分组）
+      - ./runtime_data:/app/runtime_data     # 权限数据库（用户/角色/分组）落此目录
       - ./.env:/app/.env
+    depends_on:
+      redis:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/openapi.json')"]
       interval: 10s
@@ -71,11 +98,20 @@ services:
       EMBED_SERVER_URL: http://embed-server:8001
       RERANK_SERVER_URL: http://rerank-server:8002
       API_SERVER_URL: http://api-server:8000   # 登录走容器内权限后端，替换硬编码 localhost:8000
+      # ⚠️ 必须显式注入：config 默认 localhost:6379，容器内连不到 → 限流器单例
+      # 初始化失败后会永久保持「降级放行」，直到进程重启
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # 运行产物统一目录（审计/Token/问答日志/告警/长期记忆库 → 持久化）
+      RUNTIME_DATA_DIR: /app/runtime_data
     volumes:
       - D:/VsCode/AI/.cache/huggingface:/root/.cache/huggingface
       # ChromaDB 向量库 + 上传文档 落宿主机（数据持久化）
       - ./chroma_db:/app/chroma_db
       - ./uploaded_docs:/app/uploaded_docs
+      # 运行产物目录（统一挂「目录」而非单文件——单文件挂载在宿主机文件
+      # 不存在时会被 Docker 建成同名目录，导致 SQLite 打开失败）
+      - ./runtime_data:/app/runtime_data
       - ./.env:/app/.env
     depends_on:
       api-server:
@@ -83,6 +119,8 @@ services:
       embed-server:
         condition: service_healthy
       rerank-server:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')"]

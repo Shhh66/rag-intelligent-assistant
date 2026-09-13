@@ -26,7 +26,8 @@ from mcp.client.stdio import stdio_client
 from mcp import ClientSession, StdioServerParameters
 
 from .mcp_client_manager import MCPSession
-from .circuit_breaker import CircuitBreakerError
+from .circuit_breaker import CircuitBreakerError, call_llm_with_cb
+from .prompt_templates import build_session_summary_prompt
 from rate_limiter import RateLimitError
 from .tool_registry import ToolRegistry
 from .decision_engine import DecisionEngine, SkillMatchResult
@@ -91,6 +92,7 @@ class UnifiedAgent:
 
         # 持久状态（跨 chat() 调用保留）
         self._history: list[dict] = []       # 对话历史
+        self._session_summary: str = ""      # 会话摘要（压缩早期对话，注入 system）
         self._reflection: ReflectionMemory | None = None  # 反思记忆
         self._skill_registry: SkillRegistry | None = None  # Skill 注册表
         self._user_id: str = "default"       # 当前用户身份（长期记忆隔离，请求级，不再读文件）
@@ -224,6 +226,8 @@ class UnifiedAgent:
 
                 # 3. 执行流水线
                 decision_engine = DecisionEngine(self._llm_client, self.model)
+                # 注入会话摘要（单条 system 的【历史摘要】块，压缩早期对话而来）
+                decision_engine.session_summary = self._session_summary
                 scheduler = Scheduler(mcp, tool_registry, self.call_timeout,
                                       trace_id=trace_id, kb_groups=kb_groups,
                                       permissions=permissions)
@@ -304,6 +308,34 @@ class UnifiedAgent:
         except ImportError:
             return default
 
+    def _format_collected_info(self, all_results: list[dict]) -> str:
+        """格式化已收集的信息，用于 Judge 模型判断。
+
+        Args:
+            all_results: 所有工具执行结果
+
+        Returns:
+            格式化后的信息字符串
+        """
+        if not all_results:
+            return "暂无收集到的信息"
+
+        info_parts = []
+        for i, result in enumerate(all_results, 1):
+            tool_name = result.get("tool_name", "unknown")
+            is_error = result.get("is_error", False)
+            result_content = result.get("result", "")
+
+            status = "失败" if is_error else "成功"
+            # 截断过长的结果
+            result_str = str(result_content)[:500]
+            if len(str(result_content)) > 500:
+                result_str += "..."
+
+            info_parts.append(f"{i}. [{status}] {tool_name}: {result_str}")
+
+        return "\n".join(info_parts)
+
     # ── 核心流水线 ────────────────────────────────────────────
 
     async def _pipeline(
@@ -375,10 +407,25 @@ class UnifiedAgent:
                         f"，进入 ReAct 循环"
                     )
 
-        # ═══ 步骤 1-N：ReAct 推理循环 ═══
+        # ═══ 步骤 1-N：ReAct 推理循环（五阶段版本） ═══
         skills_list = (
             self._skill_registry.get_all() if self._skill_registry else []
         )
+
+        # 五阶段状态
+        current_plan = ""  # 首轮规划，后续轮次注入
+        tool_call_signatures: list[str] = []  # 死循环检测：工具调用签名历史
+        LOOP_DETECTION_THRESHOLD = 3  # 连续相同签名阈值
+
+        # 成本控制：单任务 Token 预算（0=不限，>0 超预算强制终止返回中间结果）
+        task_budget = self._get_config_int("TASK_TOKEN_BUDGET", 0)
+
+        import hashlib
+
+        def _tool_signature(tool_name: str, arguments: dict) -> str:
+            """生成工具调用签名，用于死循环检测。"""
+            sig_str = f"{tool_name}:{sorted(arguments.items())}"
+            return hashlib.md5(sig_str.encode()).hexdigest()[:12]
 
         for turn in range(self.max_turns):
             logger.info(f"=== 第 {turn + 1}/{self.max_turns} 轮决策 ===")
@@ -411,7 +458,7 @@ class UnifiedAgent:
                         f"{str(r.get('result', ''))[:120]}"
                     )
 
-            # 3. LLM 决策（ReAct + Skill 感知）
+            # 3. LLM 决策（五阶段：Plan → Thought → Action → Observation → Evaluation → Decision）
             # 首轮传入 Skill 候选，后续轮次仅 tool（已有结果回填）
             skill_candidates_for_turn = (
                 [s for s in skills_list] if turn == 0 and skills_list else None
@@ -422,13 +469,22 @@ class UnifiedAgent:
                 tools=candidate_tools,
                 reflection_hints=hints,
                 skills_candidates=skill_candidates_for_turn,
+                turn=turn,
+                current_plan=current_plan,
             )
+
+            # 记录首轮规划
+            if turn == 0 and decision.plan:
+                current_plan = decision.plan
+                logger.info(f"规划: {current_plan[:200]}")
 
             logger.info(
                 f"决策: action={decision.action}, "
                 f"skill={decision.skill_name}, "
                 f"tools={[t.tool_name for t in decision.tools]}, "
-                f"mode={decision.execution_mode}"
+                f"mode={decision.execution_mode}, "
+                f"decision={decision.decision}, "
+                f"evaluation={decision.evaluation[:100] if decision.evaluation else ''}"
             )
 
             # 思考留痕：记录本轮 ReAct 决策（合规「每一步思考可回溯」）
@@ -438,20 +494,45 @@ class UnifiedAgent:
                     trace_id=scheduler.trace_id,
                     turn=turn,
                     action=decision.action,
-                    thought=(decision.tools[0].reason if decision.tools else ""),
+                    thought=decision.thought,
                     tool_names=[t.tool_name for t in decision.tools],
                     skill_name=decision.skill_name,
+                    plan=decision.plan,
+                    evaluation=decision.evaluation,
+                    decision=decision.decision,
                 )
             except Exception:
                 pass
 
-            # 4. 直接回答 → 返回
+            # 4. 直接回答 → 返回（含 abort 场景）
             if decision.action == "direct_answer":
                 answer = decision.direct_response or "（无法生成回答）"
                 self._record_conversation(user_input, answer)
                 return answer
 
-            # 4b. 调用 Skill（ReAct 循环内）→ 通过 SkillExecutor
+            # 4b. 死循环检测：连续 N 次相同工具签名 → 强制终止
+            if decision.tools:
+                for t in decision.tools:
+                    sig = _tool_signature(t.tool_name, t.arguments)
+                    tool_call_signatures.append(sig)
+
+                # 检查最近 N 个签名是否全部相同
+                if len(tool_call_signatures) >= LOOP_DETECTION_THRESHOLD:
+                    recent = tool_call_signatures[-LOOP_DETECTION_THRESHOLD:]
+                    if len(set(recent)) == 1:
+                        logger.warning(
+                            f"死循环检测触发：连续 {LOOP_DETECTION_THRESHOLD} 次相同工具调用 "
+                            f"({decision.tools[0].tool_name})"
+                        )
+                        answer = decision_engine.final_answer(
+                            user_input=user_input,
+                            history=self._history,
+                            tool_results=all_results,
+                        )
+                        self._record_conversation(user_input, answer)
+                        return answer
+
+            # 4c. 调用 Skill（ReAct 循环内）→ 通过 SkillExecutor
             if decision.action == "call_skill" and decision.skill_name:
                 skill = self._skill_registry.get(decision.skill_name) if self._skill_registry else None
                 if skill:
@@ -474,6 +555,69 @@ class UnifiedAgent:
                 decision.tools, decision.execution_mode
             )
             all_results.extend(results)
+
+            # 5b. 独立 Judge 模型判断信息是否足够（新增）
+            from config import JUDGE_ENABLED
+            if JUDGE_ENABLED:
+                try:
+                    from judge import get_judge
+                    from observability import obs_span
+                    judge = get_judge()
+
+                    # 格式化已收集信息
+                    collected_info = self._format_collected_info(all_results)
+
+                    # LangFuse 记录 Judge span
+                    with obs_span(
+                        name="judge_evaluate",
+                        trace_id=scheduler.trace_id,
+                        metadata={
+                            "round": turn,
+                            "collected_info_length": len(collected_info),
+                        },
+                        input=user_input,
+                    ):
+                        judge_result = judge.evaluate(
+                            task_goal=user_input,
+                            collected_info=collected_info,
+                            user_query=user_input,
+                            round_idx=turn,
+                        )
+
+                    # 审计日志记录 Judge 结果
+                    try:
+                        from tool_audit import log_decision
+                        log_decision(
+                            trace_id=scheduler.trace_id,
+                            turn=turn,
+                            action="judge",
+                            thought=f"Judge: {judge_result.decision}",
+                            tool_names=[],
+                            skill_name="",
+                            plan=current_plan,
+                            evaluation=judge_result.raw_output,
+                            decision=judge_result.decision.lower(),
+                        )
+                    except Exception:
+                        pass
+
+                    if judge_result.is_sufficient:
+                        logger.info(
+                            f"[Judge] Round {turn}: 信息足够，跳过主 LLM 决策，直接生成答案"
+                        )
+                        answer = decision_engine.final_answer(
+                            user_input=user_input,
+                            history=self._history,
+                            tool_results=all_results,
+                        )
+                        self._record_conversation(user_input, answer)
+                        return answer
+                    else:
+                        logger.info(
+                            f"[Judge] Round {turn}: 信息不足，继续下一轮"
+                        )
+                except Exception as e:
+                    logger.warning(f"[Judge] 调用失败，降级到原有逻辑: {e}")
 
             # 6. 记录反思
             if self._reflection:
@@ -518,6 +662,18 @@ class UnifiedAgent:
             if failed_names:
                 logger.warning(f"工具失败: {failed_names}，将在下一轮决策中提示 LLM")
 
+            # 成本控制：单任务 Token 预算检查（超预算强制终止返回中间结果）
+            if task_budget > 0:
+                try:
+                    from model_gateway import check_budget
+                    if check_budget(task_budget):
+                        logger.warning(
+                            f"单任务 Token 预算耗尽（{task_budget}），强制终止"
+                        )
+                        break
+                except Exception:
+                    pass
+
         # 达到最大轮次：强制汇总
         logger.info(f"达到最大轮次，汇总 {len(all_results)} 条结果")
         if all_results:
@@ -534,18 +690,93 @@ class UnifiedAgent:
 
     # ── 对话记忆 ──────────────────────────────────────────────
 
+    def _compress_history(self) -> bool:
+        """把超出窗口的早期对话压缩成摘要，滚动更新 self._session_summary。
+
+        成功：裁剪 self._history 只保留最近 SESSION_SUMMARY_KEEP_RECENT 条，返回 True。
+        未启用 / 无可压缩内容 / 调用失败：不改动 history，返回 False（调用方回退硬截断）。
+
+        滚动压缩：旧摘要作为输入参与下一轮压缩，保证摘要长度恒定、不随对话膨胀。
+        """
+        try:
+            import config as _cfg
+            enabled = getattr(_cfg, "SESSION_SUMMARY_ENABLED", True)
+            keep = max(2, int(getattr(_cfg, "SESSION_SUMMARY_KEEP_RECENT", 10)))
+            target = int(getattr(_cfg, "SESSION_SUMMARY_TARGET_TOKENS", 800))
+            max_tokens = int(getattr(_cfg, "SESSION_SUMMARY_MAX_TOKENS", 2000))
+        except Exception:
+            return False
+
+        if not enabled:
+            return False
+        if len(self._history) <= keep:
+            return False  # 没有可压缩的部分
+
+        old_msgs = self._history[:-keep]
+        recent_msgs = self._history[-keep:]
+
+        # 格式化待压缩对话
+        lines = []
+        for msg in old_msgs:
+            role = "用户" if msg.get("role") == "user" else "助手"
+            lines.append(f"[{role}]: {str(msg.get('content', ''))[:500]}")
+        dialogue = "\n".join(lines)
+
+        prompt = build_session_summary_prompt(
+            existing_summary=self._session_summary,
+            dialogue=dialogue,
+            target_tokens=target,
+        )
+
+        try:
+            resp = call_llm_with_cb(
+                self._llm_client, self.model,
+                [{"role": "user", "content": prompt}],
+                temperature=0.3, max_tokens=max_tokens,
+                call_site="memory.compress",
+            )
+            summary = (resp.choices[0].message.content or "").strip()
+            if not summary:
+                logger.warning("会话摘要压缩返回空，回退硬截断")
+                return False
+        except Exception as e:
+            logger.warning(f"会话摘要压缩失败（回退硬截断）: {e}")
+            return False
+
+        self._session_summary = summary
+        self._history = recent_msgs
+        logger.info(
+            f"会话摘要压缩: {len(old_msgs)} 条 → 摘要 {len(summary)} 字"
+            f"（保留最近 {len(recent_msgs)} 条原文）"
+        )
+        return True
+
     def _record_conversation(self, user_input: str, answer: str) -> None:
         """记录一轮对话到历史。"""
         self._history.append({"role": "user", "content": user_input})
         self._history.append({"role": "assistant", "content": answer})
-        if len(self._history) > 20:
-            self._history = self._history[-20:]
-        # 长期记忆：抽取并存储（跨会话，降级安全，不阻断）
+        # 历史上限由配置驱动：MAX_MEMORY_ROUNDS 轮 × 每轮 2 条消息（user+assistant）
+        # max(2, ...) 兜底：避免配置为 0 时 Python 的 [-0:] 切片退化成「保留全部」
+        max_msgs = max(2, self._get_config_int("MAX_MEMORY_ROUNDS", 10) * 2)
+        compressed = False
+        if len(self._history) > max_msgs:
+            # 优先压缩（保留核心决策与结论）；压缩失败/未启用则回退硬截断（原行为）
+            compressed = self._compress_history()
+            if not compressed:
+                self._history = self._history[-max_msgs:]
+        # 长期记忆（跨会话，降级安全，不阻断）
         if HAS_LONG_MEMORY:
             try:
-                get_memory().extract_and_store(
-                    self._current_user_id(), user_input, answer
-                )
+                if compressed:
+                    # 摘要驱动：从「已过滤的摘要」抽取（每 N 轮一次，信噪比更高）
+                    get_memory().extract_from_summary(
+                        self._current_user_id(), self._session_summary
+                    )
+                else:
+                    # 未压缩（开关关闭/失败/未达阈值）：保持原有「每轮从原始对话抽取」
+                    get_memory().extract_and_store(
+                        self._current_user_id(), user_input, answer
+                    )
             except Exception:
                 pass
 
@@ -579,6 +810,7 @@ class UnifiedAgent:
     def clear_memory(self) -> None:
         """清空对话记忆和反思记忆。"""
         self._history.clear()
+        self._session_summary = ""   # 会话摘要随对话历史一起清空
         if self._reflection:
             self._reflection.clear()
         logger.info("对话记忆和反思记忆已清空")

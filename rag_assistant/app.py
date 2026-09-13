@@ -35,6 +35,16 @@ if "logger" not in st.session_state:
 if "history" not in st.session_state:
     st.session_state.history = []
 
+# ===== 启动熔断器告警监控（后台线程，st.session_state 防 rerun 重复启动）=====
+# 零破坏：纯新增分支；启动失败静默降级，不影响主流程
+if "alerting_started" not in st.session_state:
+    try:
+        from alerting import start_monitor
+        start_monitor(interval=5.0)
+        st.session_state["alerting_started"] = True
+    except Exception:
+        pass
+
 # ===== 侧边栏：文档管理 =====
 with st.sidebar:
     st.header("📄 文档管理")

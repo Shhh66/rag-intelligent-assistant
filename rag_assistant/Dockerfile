@@ -5,6 +5,26 @@
 # 构建：docker build -t rag-assistant .
 # 模型缓存挂载 D 盘，避免占用 C 盘（见 docker-compose.yml volumes）
 
+# ═══════════════════════════════════════════════════════════
+# 阶段 1：构建 Vue3 前端
+# ═══════════════════════════════════════════════════════════
+FROM node:20-slim AS frontend-builder
+
+WORKDIR /frontend
+
+# 先复制 package.json 和 lock 文件（利用 Docker 缓存层）
+COPY frontend/package.json frontend/package-lock.json* ./
+
+# 安装依赖
+RUN npm ci --prefer-offline || npm install
+
+# 复制前端源码并构建
+COPY frontend/ .
+RUN npm run build
+
+# ═══════════════════════════════════════════════════════════
+# 阶段 2：Python 运行时
+# ═══════════════════════════════════════════════════════════
 FROM python:3.12-slim
 
 WORKDIR /app
@@ -25,6 +45,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # 复制项目代码（.dockerignore 已排除 venv/chroma_db/缓存等大文件）
 COPY . .
+
+# 从阶段 1 复制前端构建产物到 api_server 静态文件目录
+COPY --from=frontend-builder /frontend/dist ./frontend/dist
 
 # HF 镜像 + 模型缓存目录（volume 挂载宿主机 D 盘）
 # HF_HOME 指向挂载点，模型只下载一次，多实例共享

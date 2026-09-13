@@ -4,6 +4,9 @@
 
 负责将工具元数据、对话历史、反思记忆注入 Prompt，
 然后解析 LLM 返回的 JSON 决策为 AgentDecision 对象。
+
+输出约束：采用 Structured Outputs（response_format=json_schema），
+强制 LLM 输出符合 REACT_DECISION_SCHEMA 的 JSON。
 """
 
 import json
@@ -26,6 +29,114 @@ from .circuit_breaker import call_llm_with_cb, CircuitBreakerError
 logger = logging.getLogger(__name__)
 
 
+# ── Structured Outputs Schema ─────────────────────────────────
+# 强制 LLM 输出符合此 Schema 的 JSON，消除正则解析的不确定性
+
+REACT_DECISION_SCHEMA = {
+    "name": "react_decision",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "plan": {
+                "type": "string",
+                "description": "任务规划（首轮必填），如：1. 查天气 2. 回答"
+            },
+            "thought": {
+                "type": "string",
+                "description": "推理过程，说明为什么选择这个行动"
+            },
+            "evaluation": {
+                "type": "string",
+                "description": "评估当前进展（后续轮次必填），如：天气已查到，信息足够"
+            },
+            "decision": {
+                "type": "string",
+                "enum": ["continue", "answer", "abort"],
+                "description": "下一步决策：continue=继续, answer=汇总回答, abort=终止"
+            },
+            "action": {
+                "type": "string",
+                "enum": ["call_tools", "direct_answer"],
+                "description": "行动类型：call_tools=调用工具, direct_answer=直接回答"
+            },
+            "tools": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "tool_name": {"type": "string", "description": "工具名称"},
+                        "arguments": {"type": "object", "description": "工具参数"}
+                    },
+                    "required": ["tool_name", "arguments"],
+                    "additionalProperties": False
+                },
+                "description": "工具列表（action=call_tools 时必填）"
+            },
+            "execution_mode": {
+                "type": "string",
+                "enum": ["serial", "parallel"],
+                "description": "执行模式：serial=串行, parallel=并行"
+            },
+            "direct_response": {
+                "type": "string",
+                "description": "直接回答内容（action=direct_answer 时必填）"
+            }
+        },
+        "required": ["action"],
+        "additionalProperties": False
+    }
+}
+
+# response_format 参数（传给 OpenAI API）
+# 优先 json_schema（Structured Outputs），不支持时降级 json_object
+REACT_RESPONSE_FORMAT_STRICT = {
+    "type": "json_schema",
+    "json_schema": REACT_DECISION_SCHEMA,
+}
+REACT_RESPONSE_FORMAT_FALLBACK = {
+    "type": "json_object",
+}
+
+# Skill 匹配的 Structured Outputs Schema
+# 与主决策一致：json_schema 优先，DeepSeek 不支持时降级 json_object
+SKILL_MATCH_SCHEMA = {
+    "name": "skill_match",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "skill_name": {
+                "type": "string",
+                "description": "匹配的技能名，无匹配时为 'none'",
+            },
+            "confidence": {
+                "type": "number",
+                "description": "置信度 0.0-1.0",
+            },
+            "args": {
+                "type": "object",
+                "description": "从用户输入和对话历史中提取的技能参数",
+            },
+            "reason": {
+                "type": "string",
+                "description": "匹配或不匹配的简要说明",
+            },
+        },
+        "required": ["skill_name", "confidence", "args", "reason"],
+        "additionalProperties": False,
+    },
+}
+
+SKILL_MATCH_RESPONSE_FORMAT_STRICT = {
+    "type": "json_schema",
+    "json_schema": SKILL_MATCH_SCHEMA,
+}
+SKILL_MATCH_RESPONSE_FORMAT_FALLBACK = {
+    "type": "json_object",
+}
+
+
 @dataclass
 class ToolDecision:
     """LLM 对单个工具的调用决策"""
@@ -36,13 +147,24 @@ class ToolDecision:
 
 @dataclass
 class AgentDecision:
-    """LLM 的完整决策"""
+    """LLM 的完整决策（基于 ReAct 范式自研五阶段）
+
+    五阶段：Plan → Thought → Action → Observation → Evaluation → Decision
+    - plan: 规划内容（首轮输出）
+    - thought: 推理过程（说明为什么选择这个行动）
+    - evaluation: 评估内容（后续轮次：当前进展、信息是否足够）
+    - decision: continue / answer / abort（后续轮次：下一步决策）
+    """
     action: Literal["direct_answer", "call_tools", "call_skill"]
     tools: list[ToolDecision] = field(default_factory=list)
     execution_mode: str = "serial"
     direct_response: str | None = None
     skill_name: str = ""       # call_skill 时的 Skill 名
     skill_args: dict = field(default_factory=dict)  # call_skill 时的参数
+    plan: str = ""             # 规划内容（首轮）
+    thought: str = ""          # 推理过程
+    evaluation: str = ""       # 评估内容（后续轮次）
+    decision: str = "continue"  # continue / answer / abort
 
 
 @dataclass
@@ -64,6 +186,7 @@ class DecisionEngine:
     def __init__(self, llm_client: OpenAI, model: str = "llama-3.3-70b-versatile"):
         self.client = llm_client
         self.model = model
+        self.session_summary: str = ""   # 会话摘要（由 UnifiedAgent 每请求注入；独立使用时为空）
 
     # ── 主决策 ────────────────────────────────────────────────
 
@@ -265,15 +388,19 @@ class DecisionEngine:
         )
 
         messages = [
-            {"role": "system", "content": "你是一个精确的技能匹配引擎，只输出指定格式。"},
+            {"role": "system", "content": "你是一个精确的技能匹配引擎，只输出 JSON。"},
             {"role": "user", "content": prompt},
         ]
+
+        response_format = SKILL_MATCH_RESPONSE_FORMAT_STRICT
 
         for attempt in range(2):  # 解析失败允许重试 1 次
             try:
                 response = call_llm_with_cb(
                     self.client, self.model, messages,
-                    temperature=0.1, max_tokens=4000, call_site="decision_engine.match_skill",
+                    temperature=0.1, max_tokens=4000,
+                    call_site="decision_engine.match_skill",
+                    response_format=response_format,
                 )
                 raw_text = response.choices[0].message.content or ""
                 logger.debug(f"Skill 确认原始输出: {raw_text[:200]}")
@@ -287,35 +414,52 @@ class DecisionEngine:
                     })
                     messages.append({
                         "role": "user",
-                        "content": "格式错误，请严格按照 SKILL: <技能名>\\n参数: ```json {...}``` 格式输出"
+                        "content": "输出格式有误，请严格按照 JSON Schema 输出。"
                     })
             except CircuitBreakerError:
                 raise
             except Exception as e:
+                err_msg = str(e)
+                # json_schema 不支持时降级到 json_object
+                if "response_format" in err_msg and "unavailable" in err_msg:
+                    logger.warning(f"json_schema 不支持，降级到 json_object: {e}")
+                    response_format = SKILL_MATCH_RESPONSE_FORMAT_FALLBACK
+                    continue
                 logger.error(f"Skill 匹配 LLM 调用失败: {e}")
                 break
 
         return None
 
     def _parse_skill_result(self, raw_text: str) -> SkillMatchResult | None:
-        """解析 LLM 的 Skill 确认输出。"""
-        if not raw_text or "none" in raw_text.lower().split("\n")[0]:
+        """解析 Structured Outputs 返回的 JSON（硬约束版本）。
+
+        Schema 保证输出是合法 JSON，直接 json.loads + 字段映射。
+        skill_name 为 "none" 表示无匹配，返回 None。
+        """
+        if not raw_text:
             return None
 
-        # 提取 SKILL: <name>
-        skill_match = re.search(r'SKILL:\s*(\S+)', raw_text)
-        if not skill_match:
-            return None
-        skill_name = skill_match.group(1)
-        if skill_name.lower() == "none":
+        try:
+            data = json.loads(raw_text.strip())
+        except json.JSONDecodeError as e:
+            logger.warning(f"Skill 匹配返回非法 JSON（不应发生）: {e}")
             return None
 
-        # 提取置信度
-        conf_match = re.search(r'置信度:\s*([\d.]+)', raw_text)
-        confidence = float(conf_match.group(1)) if conf_match else 0.7
+        skill_name = (data.get("skill_name") or "").strip()
+        if not skill_name or skill_name.lower() == "none":
+            return None
 
-        # 提取参数
-        args = self._extract_json_block(raw_text) or {}
+        confidence = data.get("confidence")
+        if not isinstance(confidence, (int, float)):
+            # 降级到 json_object 时可能返回字符串数字（如 "0.92"），尝试转换
+            try:
+                confidence = float(confidence)
+            except (TypeError, ValueError):
+                confidence = 0.7  # 缺省置信度，兼容旧逻辑
+
+        args = data.get("args") or {}
+        if not isinstance(args, dict):
+            args = {}
 
         logger.info(
             f"Skill 确认: {skill_name} (置信度={confidence:.2f}, "
@@ -323,10 +467,25 @@ class DecisionEngine:
         )
         return SkillMatchResult(
             skill_name=skill_name,
-            confidence=confidence,
+            confidence=float(confidence),
             args=args,
             raw_response=raw_text,
         )
+
+    # ── system 构建（单条 system，两块结构）────────────────────
+
+    def _build_system_content(
+        self, base: str = "你是一个使用 ReAct 模式推理的智能助手决策引擎。"
+    ) -> str:
+        """构建 system 内容：基础系统提示词 + 【历史摘要】段落。
+
+        单条 system、两块结构——不新增多条 system 消息。
+        无摘要时只返回基础提示词（行为与改造前完全一致）。
+        """
+        summary = (getattr(self, "session_summary", "") or "").strip()
+        if summary:
+            return f"{base}\n\n【历史摘要】：{summary}"
+        return base
 
     # ── ReAct 输出解析 ────────────────────────────────────────
 
@@ -337,10 +496,17 @@ class DecisionEngine:
         tools: list[ToolMeta],
         reflection_hints: list[str],
         skills_candidates: list[dict] | None = None,
+        turn: int = 0,
+        current_plan: str = "",
     ) -> AgentDecision:
-        """增强版决策：优先 Skill 匹配 + ReAct 推理。
+        """增强版决策：优先 Skill 匹配 + ReAct 推理（五阶段版本）。
 
         返回 AgentDecision，action 可能是 call_skill / call_tools / direct_answer。
+        五阶段：Plan → Thought → Action → Observation → Evaluation → Decision
+
+        Args:
+            turn: 当前轮次（0=首轮，>0=后续轮次）
+            current_plan: 当前已有的规划内容（后续轮次注入）
         """
         from .tool_registry import ToolRegistry
         temp_registry = ToolRegistry()
@@ -371,18 +537,25 @@ class DecisionEngine:
             tools_description=tools_description,
             reflection_hints=reflection_hints,
             skills_description=skills_description,
+            turn=turn,
+            current_plan=current_plan,
         )
 
         messages = [
-            {"role": "system", "content": "你是一个使用 ReAct 模式推理的智能助手决策引擎。"},
+            {"role": "system", "content": self._build_system_content()},
             {"role": "user", "content": prompt},
         ]
+
+        raw_text = ""
+        response_format = REACT_RESPONSE_FORMAT_STRICT
 
         for attempt in range(2):
             try:
                 response = call_llm_with_cb(
                     self.client, self.model, messages,
-                    temperature=0.1, max_tokens=4000, call_site="decision_engine.decide",
+                    temperature=0.1, max_tokens=4000,
+                    call_site="decision_engine.decide",
+                    response_format=response_format,
                 )
                 raw_text = response.choices[0].message.content or ""
                 logger.debug(f"ReAct 决策原始输出: {raw_text[:300]}")
@@ -390,16 +563,22 @@ class DecisionEngine:
                 if decision is not None:
                     return decision
 
-                # 重试
+                # 重试（Structured Outputs 一般不会解析失败，保留兜底）
                 if attempt == 0:
                     messages.append({"role": "assistant", "content": raw_text})
                     messages.append({
                         "role": "user",
-                        "content": "格式有误。请按指定格式输出：SKILL/Thought→Action/Final Answer。"
+                        "content": "输出格式有误，请严格按照 JSON Schema 输出。"
                     })
             except CircuitBreakerError:
                 raise
             except Exception as e:
+                err_msg = str(e)
+                # json_schema 不支持时降级到 json_object
+                if "response_format" in err_msg and "unavailable" in err_msg:
+                    logger.warning(f"json_schema 不支持，降级到 json_object: {e}")
+                    response_format = REACT_RESPONSE_FORMAT_FALLBACK
+                    continue
                 logger.error(f"ReAct 决策调用失败: {e}")
                 break
 
@@ -416,59 +595,70 @@ class DecisionEngine:
         )
 
     def _parse_react_output(self, raw_text: str) -> AgentDecision | None:
-        """解析 ReAct 格式输出（含 SKILL 指令）。
+        """解析 Structured Outputs 返回的 JSON（硬约束版本）。
 
-        支持格式：
-        - SKILL: <name>\\n参数: ```json {...}```
-        - Thought: ...\\nAction: <tool>\\n参数: ```json {...}```
-        - {"action":"direct_answer","response":"..."}
+        由于 response_format=json_schema 保证了输出是合法 JSON，
+        解析逻辑大幅简化：直接 json.loads + 字段映射。
+        五阶段字段：plan, thought, evaluation, decision
         """
         if not raw_text:
             return None
 
         text = raw_text.strip()
 
-        # 检测 SKILL 指令
-        skill_match = re.search(r'SKILL:\s*(\S+)', text)
-        if skill_match:
-            skill_name = skill_match.group(1)
-            args = self._extract_json_block(text) or {}
-            logger.info(f"ReAct 输出: SKILL {skill_name}")
+        # Structured Outputs 保证是合法 JSON，直接解析
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as e:
+            logger.warning(f"Structured Outputs 返回非法 JSON（不应发生）: {e}")
+            return None
+
+        # 提取五阶段字段（Schema 已保证类型正确）
+        action = data.get("action", "direct_answer")
+        plan = data.get("plan", "")
+        thought = data.get("thought", "")
+        evaluation = data.get("evaluation", "")
+        decision = data.get("decision", "continue")
+
+        # decision=abort → 强制转为 direct_answer
+        if decision == "abort":
             return AgentDecision(
-                action="call_skill",
-                skill_name=skill_name,
-                skill_args=args,
+                action="direct_answer",
+                direct_response=data.get("direct_response", "")
+                    or evaluation
+                    or "抱歉，遇到无法解决的问题，请求终止。",
+                plan=plan,
+                thought=thought,
+                evaluation=evaluation,
+                decision=decision,
             )
 
-        # 检测 Thought/Action（ReAct 格式）
-        action_match = re.search(r'Action:\s*(\S+)', text)
-        thought_match = re.search(r'Thought:\s*(.+?)(?:\n|$)', text)
-
-        if action_match:
-            tool_name = action_match.group(1)
-            args = self._extract_json_block(text) or {}
-            thought = thought_match.group(1).strip()[:200] if thought_match else ""
-
+        # direct_answer 模式
+        if action == "direct_answer":
             return AgentDecision(
-                action="call_tools",
-                tools=[ToolDecision(
-                    tool_name=tool_name,
-                    arguments=args,
-                    reason=thought,
-                )],
-                execution_mode="serial",
+                action="direct_answer",
+                direct_response=data.get("direct_response", ""),
+                plan=plan,
+                thought=thought,
+                evaluation=evaluation,
+                decision=decision,
             )
 
-        # 回退：尝试 JSON 解析
-        return self._parse_decision(text)
+        # call_tools 模式
+        tools = []
+        for t in data.get("tools", []):
+            tools.append(ToolDecision(
+                tool_name=t.get("tool_name", ""),
+                arguments=t.get("arguments", {}),
+                reason=thought,
+            ))
 
-    @staticmethod
-    def _extract_json_block(text: str) -> dict | None:
-        """从文本中提取 ```json ... ``` 代码块。"""
-        match = re.search(r'```json\s*(.*?)\s*```', text, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group(1))
-            except json.JSONDecodeError:
-                pass
-        return None
+        return AgentDecision(
+            action="call_tools",
+            tools=tools,
+            execution_mode=data.get("execution_mode", "serial"),
+            plan=plan,
+            thought=thought,
+            evaluation=evaluation,
+            decision=decision,
+        )

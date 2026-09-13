@@ -1,14 +1,22 @@
 """评测日志模块 —— 记录问答质量，支持分析与迭代"""
 
 import json
+import os
 from datetime import datetime
 from pathlib import Path
+
+# 默认日志路径：设了 RUNTIME_DATA_DIR 就放进去（Docker 挂载卷持久化），
+# 否则用 CWD 下的相对路径（原行为）
+_RUNTIME_DIR = os.getenv("RUNTIME_DATA_DIR", "")
+_DEFAULT_QA_LOG = (
+    str(Path(_RUNTIME_DIR) / "qa_log.jsonl") if _RUNTIME_DIR else "qa_log.jsonl"
+)
 
 
 class EvaluationLogger:
     """记录和评估每次问答的质量"""
 
-    def __init__(self, log_file: str = "qa_log.jsonl"):
+    def __init__(self, log_file: str = _DEFAULT_QA_LOG):
         self.log_file = Path(log_file)
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 

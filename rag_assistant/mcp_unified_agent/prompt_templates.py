@@ -1,11 +1,13 @@
 """Prompt 模板
 
-包含 ReAct 决策、Skill 匹配、最终回答三套 Prompt 模板。
+包含 ReAct 决策（五阶段：Plan→Thought→Action→Observation→Evaluation→Decision）、
+Skill 匹配、最终回答三套 Prompt 模板。
 """
 
-# ── ReAct 决策 Prompt ──────────────────────────────────────────
+# ── ReAct 决策 Prompt（五阶段） ─────────────────────────────────
 
-DECISION_SYSTEM_PROMPT = """你是一个使用 ReAct 模式推理的智能助手决策引擎。
+# 首轮 Prompt：强制输出规划
+DECISION_PROMPT_TURN0 = """你是一个使用 ReAct 模式推理的智能助手决策引擎。
 
 ## 可用技能（优先使用）
 {skills_description}
@@ -14,14 +16,13 @@ DECISION_SYSTEM_PROMPT = """你是一个使用 ReAct 模式推理的智能助手
 {tools_description}
 
 ## 推理规则
-1. **优先匹配技能**：如果用户意图与某个技能匹配，直接调用技能（输出 SKILL 格式）
-2. **无匹配时推理**：无技能匹配时，使用 Thought → Action → Observation 逐步推理
+1. **首轮必须输出 Plan**：先规划完成用户问题需要几步、每步做什么，再执行
+2. **逐步推理**：使用 Plan → Thought → Action 逐步推理，不要跳步
 3. **多工具执行模式**：
-   - parallel：工具/技能间互相独立，可同时执行（如同时查天气和知识库）
+   - parallel：工具间互相独立，可同时执行（如同时查天气和知识库）
    - serial：后续步骤依赖前面结果（如先检索再生成回答）
 4. **参数推断**：如果用户没有明确提供所有参数值，根据上下文合理推断
-5. **已执行工具的处理**：如果"工具选择历史"中显示本轮已有工具成功执行并返回结果，你必须使用 direct_answer 汇总这些结果来回答用户，**不要再调用工具**。
-6. **参数格式**：工具参数必须用 ```json 代码块输出，不要使用普通文本。
+5. **参数格式**：工具参数必须用 ```json 代码块输出，不要使用普通文本。
 
 ## 工具选择历史（供参考）
 {reflection_hints}
@@ -32,25 +33,101 @@ DECISION_SYSTEM_PROMPT = """你是一个使用 ReAct 模式推理的智能助手
 ## 用户当前问题
 {user_query}
 
-## 你的决策
+## 你的决策（首轮，必须包含 Plan，严格遵守 JSON 格式）
 
-使用技能时：
-SKILL: <技能名>
-参数: ```json
-{{"参数名": "参数值"}}
-```
+你必须输出一个合法的 JSON 对象，格式如下：
 
-直接推理时（严格遵守格式）：
-Thought: <你的推理过程>
-Action: <工具名>
-参数: ```json
-{{"参数名": "参数值"}}
+调用工具时：
+```json
+{{
+  "plan": "1. [步骤1] 2. [步骤2] 3. [步骤3]",
+  "thought": "<你的推理过程>",
+  "action": "call_tools",
+  "tools": [{{"tool_name": "<工具名>", "arguments": {{"参数名": "参数值"}}}}],
+  "execution_mode": "serial"
+}}
 ```
 
 直接回答时：
-{{"action":"direct_answer","response":"你的回答内容"}}
+```json
+{{
+  "plan": "无需工具调用",
+  "thought": "<你的推理过程>",
+  "action": "direct_answer",
+  "direct_response": "<你的回答内容>"
+}}
+```
 
-请输出你的决策："""
+请输出你的决策 JSON："""
+
+# 后续轮次 Prompt：包含评估+决策
+DECISION_PROMPT_TURN_N = """你是一个使用 ReAct 模式推理的智能助手决策引擎。
+
+## 可用技能（优先使用）
+{skills_description}
+
+## 可用工具
+{tools_description}
+
+## 当前规划（首轮制定）
+{current_plan}
+
+## 推理规则
+1. **先评估再行动**：每轮必须先输出 Evaluation（评估当前进展）和 Decision（决定下一步）
+2. **Decision 含义**：
+   - continue：计划未完成，继续执行下一步
+   - answer：信息已足够，使用 direct_answer 汇总回答
+   - abort：遇到无法解决的问题，强制终止并说明原因
+3. **已执行工具的处理**：如果"工具选择历史"中显示本轮已有工具成功执行并返回结果，你必须使用 direct_answer 汇总这些结果来回答用户，**不要再调用工具**。
+
+## 工具选择历史（供参考）
+{reflection_hints}
+
+## 对话历史
+{history}
+
+## 用户当前问题
+{user_query}
+
+## 你的决策（第 {turn} 轮，严格遵守 JSON 格式）
+
+你必须输出一个合法的 JSON 对象，格式如下：
+
+继续推理时：
+```json
+{{
+  "evaluation": "<已完成X步，剩余Y步，当前信息是否足够>",
+  "decision": "continue",
+  "thought": "<你的推理过程>",
+  "action": "call_tools",
+  "tools": [{{"tool_name": "<工具名>", "arguments": {{"参数名": "参数值"}}}}],
+  "execution_mode": "serial"
+}}
+```
+
+汇总回答时（信息已足够）：
+```json
+{{
+  "evaluation": "<所有必要信息已获取>",
+  "decision": "answer",
+  "thought": "<你的推理过程>",
+  "action": "direct_answer",
+  "direct_response": "<你的回答内容>"
+}}
+```
+
+强制终止时（遇到无法解决的问题）：
+```json
+{{
+  "evaluation": "<说明无法继续的原因>",
+  "decision": "abort",
+  "thought": "<你的推理过程>",
+  "action": "direct_answer",
+  "direct_response": "抱歉，无法完成请求：[具体原因]"
+}}
+```
+
+请输出你的决策 JSON："""
 
 
 def build_decision_prompt(
@@ -59,12 +136,16 @@ def build_decision_prompt(
     tools_description: str,
     reflection_hints: list[str],
     skills_description: str = "",
+    turn: int = 0,
+    current_plan: str = "",
 ) -> str:
-    """构建 ReAct 决策 Prompt。
+    """构建 ReAct 决策 Prompt（五阶段版本）。
 
     Args:
         skills_description: 可用 Skill 的描述文本（Top3候选），
                            为空时表示无匹配 Skill
+        turn: 当前轮次（0=首轮，>0=后续轮次）
+        current_plan: 当前已有的规划内容（后续轮次注入）
     """
     # 格式化对话历史
     if history:
@@ -95,13 +176,25 @@ def build_decision_prompt(
     else:
         hints_text = "（无历史工具选择记录）"
 
-    return DECISION_SYSTEM_PROMPT.format(
-        skills_description=skills_description or "（无匹配技能）",
-        tools_description=tools_description,
-        history=history_text,
-        user_query=user_input,
-        reflection_hints=hints_text,
-    )
+    # 根据轮次选择 Prompt 模板
+    if turn == 0:
+        return DECISION_PROMPT_TURN0.format(
+            skills_description=skills_description or "（无匹配技能）",
+            tools_description=tools_description,
+            history=history_text,
+            user_query=user_input,
+            reflection_hints=hints_text,
+        )
+    else:
+        return DECISION_PROMPT_TURN_N.format(
+            skills_description=skills_description or "（无匹配技能）",
+            tools_description=tools_description,
+            current_plan=current_plan or "（无规划记录）",
+            turn=turn,
+            history=history_text,
+            user_query=user_input,
+            reflection_hints=hints_text,
+        )
 
 
 # ── Skill 确认 + 参数提取 Prompt ─────────────────────────────
@@ -118,21 +211,17 @@ SKILL_RECOGNITION_PROMPT = """你是一个技能匹配助手。根据用户的�
 {user_query}
 
 ## 任务
-1. 判断哪个技能最匹配用户意图（如果都不匹配，输出 "none"）
-2. 如果匹配，从用户输入和对话历史中提取技能所需的参数值
-3. 参数值必须用 ```json 代码块输出
+1. 判断哪个技能最匹配用户意图（如果都不匹配，skill_name 输出 "none"）
+2. 如果匹配，从用户输入和对话历史中提取技能所需的参数值填入 args
 
 ## 输出格式
+必须输出一个合法的 JSON 对象：
+
 匹配时：
-SKILL: <技能名>
-置信度: <0.0-1.0>
-参数: ```json
-{{"参数名": "参数值"}}
-```
+{{"skill_name": "<技能名>", "confidence": 0.92, "args": {{"参数名": "参数值"}}, "reason": "<匹配说明>"}}
 
 无匹配时：
-SKILL: none
-原因: <简短说明>"""
+{{"skill_name": "none", "confidence": 0.0, "args": {{}}, "reason": "<不匹配原因>"}}"""
 
 
 def build_skill_recognition_prompt(
@@ -217,3 +306,70 @@ def build_final_answer_prompt(
         history=history_text,
         user_query=user_input,
     )
+
+
+# ── 会话摘要压缩 Prompt（早期对话 → 摘要，滚动更新）────────────
+
+SESSION_SUMMARY_PROMPT = """你是一个对话摘要压缩器。把下面的对话压缩成简洁摘要。
+
+## 已有摘要（如有，需与新内容合并；无则忽略）
+{existing_summary}
+
+## 待压缩的对话
+{dialogue}
+
+## 压缩要求
+1. **必须保留**：用户的核心诉求与目标、已确认的结论/决策/约束（如"只用中文"）、未完成的待办、关键实体（项目名、专有名词、数字）
+2. **可以丢弃**：寒暄、重复确认、失败尝试的中间过程
+3. 输出长度控制在约 {target_tokens} token
+4. 用陈述句写摘要，直接输出摘要正文，不要 JSON、不要解释、不要加标题
+
+## 摘要："""
+
+
+def build_session_summary_prompt(
+    existing_summary: str,
+    dialogue: str,
+    target_tokens: int = 800,
+) -> str:
+    """构建会话摘要压缩 Prompt（滚动压缩：旧摘要参与合并）。"""
+    return SESSION_SUMMARY_PROMPT.format(
+        existing_summary=existing_summary or "（无，这是首次压缩）",
+        dialogue=dialogue,
+        target_tokens=target_tokens,
+    )
+
+
+# ── 长期记忆抽取 Prompt（从会话摘要中提长期有效信息）──────────
+
+MEMORY_EXTRACT_PROMPT = """你是一个长期记忆抽取器。从下面的会话摘要中，只抽取【长期有效】的用户信息。
+
+## 会话摘要
+{summary}
+
+## 抽取口径
+✅ **保留**：
+- 用户偏好（专业方向、习惯、明确的好恶）
+- 固定参数 / 固定约束（如"总是用中文回答"、"排除某部门文档"）
+- 业务规则（领域内的固定规则）
+- 高频工具选择经验
+
+❌ **丢弃**：
+- 本次临时任务（一次性的具体问题）
+- 中间思考过程
+- 一次性问答
+
+## 输出格式
+按 JSON 数组输出，每项 {{"mem_type":"profile|entity|conclusion","content":"一句话事实","confidence":0~1}}
+- profile = 用户画像（身份/专业/固定偏好/固定约束）
+- entity = 项目/关注的技术
+- conclusion = 已确认的结论
+
+没有值得长期记住的内容就输出 []。只输出 JSON，不要解释。
+
+## JSON："""
+
+
+def build_memory_extract_prompt(summary: str) -> str:
+    """构建从会话摘要抽取长期记忆的 Prompt。"""
+    return MEMORY_EXTRACT_PROMPT.format(summary=summary)

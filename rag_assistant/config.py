@@ -6,6 +6,19 @@ from dotenv import load_dotenv
 _env_path = Path(__file__).resolve().parent / ".env"
 load_dotenv(_env_path)
 
+# ===== 运行产物目录（Docker 持久化用）=====
+# 留空 = 各运行产物（审计/Token/告警/记忆等）用自身默认位置，行为与改造前完全一致。
+# 设置后 = 统一落到该目录，便于容器把整个目录挂载到宿主机做持久化
+#          （Docker 下由 docker-compose 注入 RUNTIME_DATA_DIR=/app/runtime_data）。
+RUNTIME_DATA_DIR = os.getenv("RUNTIME_DATA_DIR", "")
+
+
+def runtime_path(filename: str, default: str) -> str:
+    """运行产物路径解析：设了 RUNTIME_DATA_DIR 就放进去，否则用默认值（行为不变）。"""
+    if RUNTIME_DATA_DIR:
+        return str(Path(RUNTIME_DATA_DIR) / filename)
+    return default
+
 # ===== DeepSeek API 配置 =====
 # API Key 存放在 .env 文件中，不提交到 Git
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
@@ -33,7 +46,13 @@ CHUNK_SIZE = 500                   # 每个文本块最多 500 字
 CHUNK_OVERLAP = 50                 # 相邻块之间重叠 50 字
 
 # ===== 对话记忆配置 =====
-MAX_MEMORY_ROUNDS = 10             # 最多记住 10 轮对话
+MAX_MEMORY_ROUNDS = 10             # 原始对话保留窗口（轮），每轮 = user+assistant 2 条消息
+
+# ===== 会话摘要压缩配置（早期对话压缩为摘要，替代硬截断）=====
+SESSION_SUMMARY_ENABLED = True        # 压缩总开关（False=退回纯窗口截断，行为与改造前一致）
+SESSION_SUMMARY_KEEP_RECENT = 10      # 压缩后保留的最近消息条数（原文保真）
+SESSION_SUMMARY_TARGET_TOKENS = 800   # 摘要目标长度（500~1000 token 区间中值）
+SESSION_SUMMARY_MAX_TOKENS = 2000     # 压缩调用 max_tokens（推理模型需给足，否则 content 空串）
 
 # ===== 检索配置 =====
 TOP_K = 8                          # 每次检索返回 8 个最相关片段（需覆盖同名Section场景）
@@ -103,7 +122,7 @@ RERANK_CALIBRATION_MAX_RATIO = 1.2          # 双语校准最大补偿倍数（�
 # ===== 权限控制配置 =====
 KB_DEFAULT_GROUP = "default"                 # 默认知识库分组
 KB_DEFAULT_VISIBILITY = "internal"           # 默认可见性（public | internal）
-KB_PERMISSION_DB = "./permission.db"         # SQLite 权限数据库路径
+KB_PERMISSION_DB = runtime_path("permission.db", "./permission.db")  # SQLite 权限数据库路径
 KB_PERMISSION_SECRET_KEY = os.getenv("KB_PERMISSION_SECRET_KEY", "rag-kb-secret-change-in-production")  # JWT 签名密钥（生产环境用 .env 覆盖）
 KB_PERMISSION_TOKEN_EXPIRE_HOURS = 24        # JWT Token 过期时间（小时）
 
@@ -121,6 +140,13 @@ RERANK_SERVER_TIMEOUT = 60.0                 # 重排服务单次请求超时（
 CB_ENABLED = True                            # 熔断总开关
 CB_FAILURE_THRESHOLD = 5                     # 连续失败 N 次打开熔断
 CB_COOLDOWN_SECONDS = 30                     # 熔断冷却时间（秒），之后放行 1 次试探
+
+# ===== 熔断器告警配置（alerting.py 轻量告警）=====
+ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "")  # 钉钉/飞书机器人 webhook（留空=仅落盘+日志，不发通知）
+
+# ===== 成本控制：模型网关配置（model_gateway.py）=====
+MODEL_ROUTE = {}                              # call_site → 模型名（空=不路由，全用默认模型；如 {"decision_engine.match_skill": "deepseek-chat"}）
+TASK_TOKEN_BUDGET = 0                         # 单任务 Token 预算（0=不限；>0 超预算强制终止返回中间结果）
 
 # ===== 检索结果缓存配置（部署运维改造 P2）=====
 SEARCH_CACHE_ENABLED = True                  # 检索缓存总开关
@@ -166,7 +192,7 @@ SIMPLETEX_API_KEY = os.getenv("SIMPLETEX_API_KEY", "")             # 在 https:/
 
 FORMULA_TIMEOUT = 8                 # 单次请求超时（秒）
 FORMULA_MAX_RETRIES = 3             # 最大重试次数
-FORMULA_CACHE_PATH = "./formula_cache.json"  # 公式结果缓存文件
+FORMULA_CACHE_PATH = runtime_path("formula_cache.json", "./formula_cache.json")  # 公式结果缓存文件
 
 # 公式检测阈值
 FORMULA_SYMBOL_RATIO = 0.15          # 文本行数学符号占比 > 15% → 疑似公式
@@ -192,7 +218,7 @@ VECTOR_TOP_K = 10                         # 向量单路召回数
 RRF_K = 60                                # RRF 融合常数（越大越平滑，经验值 60）
 BM25_RRF_WEIGHT = 1.0                     # BM25 路 RRF 权重（预留，默认对等）
 VECTOR_RRF_WEIGHT = 1.0                   # 向量路 RRF 权重（预留，默认对等）
-BM25_INDEX_PATH = "./bm25_index.pkl"      # BM25 索引持久化文件
+BM25_INDEX_PATH = runtime_path("bm25_index.pkl", "./bm25_index.pkl")  # BM25 索引持久化文件
 BM25_STOPWORDS_PATH = "./bm25_stopwords.txt"  # 中文停用词表（可选，不存在则不过滤）
 
 # ===== 查询改写配置（Query Rewrite）=====
@@ -211,9 +237,16 @@ TOOL_RETRY_MAX_WAIT = 8.0                 # 单次最大等待（秒）
 
 # ===== 工具调用审计（结构化落盘 + trace_id）=====
 TOOL_AUDIT_ENABLED = True                 # 审计开关
-TOOL_AUDIT_PATH = "./tool_audit.jsonl"    # 审计日志文件（实时追加）
+TOOL_AUDIT_PATH = runtime_path("tool_audit.jsonl", "./tool_audit.jsonl")  # 审计日志文件（实时追加）
 TOOL_AUDIT_ARG_MAXLEN = 500               # 单个入参值截断长度（脱敏+防膨胀）
 TOOL_AUDIT_SENSITIVE_KEYS = ["api_key", "secret", "token", "password"]  # 掩码字段
+
+# ===== 独立 Judge 模型配置（终止条件判断）=====
+JUDGE_ENABLED = True                      # 是否启用独立 Judge
+JUDGE_MODEL = os.getenv("JUDGE_MODEL", "deepseek-v4-flash")  # Judge 模型（可用更小模型）
+JUDGE_MAX_TOKENS = 512                    # 推理模型需要给 reasoning 留足空间
+JUDGE_TEMPERATURE = 0.0                   # 确定性输出
+JUDGE_TIMEOUT = 30                        # Judge 调用超时（秒）
 
 # ===== 可观测性（LangFuse 自托管）=====
 LANGFUSE_ENABLED = False                  # 总开关（默认关，需先起 LangFuse 服务再开）
@@ -224,7 +257,7 @@ LANGFUSE_HOST = os.getenv("LANGFUSE_HOST", "http://localhost:3000")
 
 # ===== 长期记忆（跨会话实体记忆与检索）=====
 LONG_TERM_MEMORY_ENABLED = True           # 长期记忆总开关
-MEMORY_DB_PATH = "./memory.db"            # SQLite 结构化存储（实体事实）
+MEMORY_DB_PATH = runtime_path("memory.db", "./memory.db")  # SQLite 结构化存储（实体事实）
 MEMORY_COLLECTION = "memory"              # Chroma collection（独立于 langchain 主库）
 MEMORY_RETRIEVE_TOP_K = 3                 # 每轮注入的记忆条数
 MEMORY_EXTRACT_ENABLED = True             # 实体抽取开关（False=仅存对话摘要，即 V0.5）

@@ -115,7 +115,7 @@ def get_breaker(destination: str = DESTINATION_MCP_CHANNEL) -> CircuitBreaker:
     return _breakers[destination]
 
 
-def call_llm_with_cb(client, model, messages, temperature, max_tokens, call_site):
+def call_llm_with_cb(client, model, messages, temperature, max_tokens, call_site, **kwargs):
     """统一 LLM 调用入口（主进程常驻）：熔断 + 成功/失败记录。
 
     client：OpenAI 实例（主进程常驻的 _llm_client，跨请求复用）。
@@ -124,7 +124,16 @@ def call_llm_with_cb(client, model, messages, temperature, max_tokens, call_site
 
     只应在「常驻进程」里调用（主进程 decision_engine / skill_executor）。
     子进程（retriever.py）是 per-request 的，熔断状态无法跨请求累积，不适用。
+
+    **kwargs：透传给 OpenAI API 的额外参数（如 response_format）。
     """
+    # 成本控制：按 call_site 路由模型（MODEL_ROUTE 未配置 → 用调用方传入的 model，行为不变）
+    try:
+        from model_gateway import route_model
+        model = route_model(call_site, model)
+    except Exception:
+        pass  # 路由失败不影响主链路，用原 model
+
     breaker = get_breaker(DESTINATION_LLM)
     if not breaker.allow_request():
         raise CircuitBreakerError("DeepSeek 熔断打开，请求快速失败")
@@ -141,6 +150,7 @@ def call_llm_with_cb(client, model, messages, temperature, max_tokens, call_site
         resp = client.chat.completions.create(
             model=model, messages=messages,
             temperature=temperature, max_tokens=max_tokens,
+            **kwargs,
         )
     except Exception:
         breaker.record_failure()

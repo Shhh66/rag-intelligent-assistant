@@ -10,9 +10,11 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.security import HTTPBearer
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import jwt
 
@@ -691,6 +693,38 @@ def refresh_token(user=Depends(get_current_user)):
         user.get("permissions", []), user.get("kb_groups", []),
     )
     return {"token": new_token}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 前端静态文件服务（Vue3 构建产物）
+# ═══════════════════════════════════════════════════════════════
+
+import os
+
+# 前端构建产物目录（Docker 构建时从 frontend-builder 阶段复制）
+FRONTEND_DIST = Path(__file__).parent / "frontend" / "dist"
+
+if FRONTEND_DIST.exists():
+    # 挂载静态资源（JS/CSS/图片等）
+    app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST / "assets")), name="frontend-assets")
+
+    @app.get("/")
+    async def serve_index():
+        """服务前端入口页面"""
+        return FileResponse(str(FRONTEND_DIST / "index.html"))
+
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        """SPA 路由兜底：非 API 路径一律返回 index.html"""
+        # API 路径不拦截
+        if full_path.startswith("api/"):
+            raise HTTPException(404, "API 路径不存在")
+        # 静态文件存在则直接返回
+        file_path = FRONTEND_DIST / full_path
+        if file_path.is_file():
+            return FileResponse(str(file_path))
+        # 其余路径返回 index.html（前端路由处理）
+        return FileResponse(str(FRONTEND_DIST / "index.html"))
 
 
 # ═══════════════════════════════════════════════════════════════

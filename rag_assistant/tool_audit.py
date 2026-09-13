@@ -93,11 +93,21 @@ def log_decision(
     thought: str = "",
     tool_names: list = None,
     skill_name: str = "",
+    plan: str = "",
+    evaluation: str = "",
+    decision: str = "",
 ) -> None:
-    """记录一条 ReAct 决策（思考留痕，与工具调用审计同一 jsonl、同一 trace_id）。
+    """记录一条 ReAct 决策（基于 ReAct 范式自研五阶段，与工具调用审计同一 jsonl）。
 
     合规要求「每一步思考可回溯」——记录 Agent 每轮决策的行动类型、思考、拟调工具。
+    五阶段：Plan → Thought → Action → Observation → Evaluation → Decision
     用 type="decision" 区分工具调用记录（type 缺省 = 工具调用）。
+
+    Args:
+        plan: 规划内容（首轮）
+        thought: 推理过程
+        evaluation: 评估内容（后续轮次）
+        decision: continue / answer / abort
     """
     enabled, path, maxlen, sensitive = _cfg()
     if not enabled:
@@ -112,6 +122,9 @@ def log_decision(
             "thought": (thought or "")[:300],
             "tool_names": tool_names or [],
             "skill_name": skill_name or "",
+            "plan": (plan or "")[:500],
+            "evaluation": (evaluation or "")[:300],
+            "decision": decision or "",
         }
         with open(_audit_path(path), "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")

@@ -23,6 +23,7 @@
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -30,8 +31,11 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# 持久化文件路径（存放在 rag_assistant 目录下）
-_PERSIST_FILE = Path(__file__).resolve().parent / "token_log.jsonl"
+# 持久化文件路径：设了 RUNTIME_DATA_DIR 就放进去（Docker 挂载卷持久化），
+# 否则用项目目录（原行为，容器重建会丢）
+_PERSIST_FILE = Path(
+    os.getenv("RUNTIME_DATA_DIR") or Path(__file__).resolve().parent
+) / "token_log.jsonl"
 
 
 @dataclass

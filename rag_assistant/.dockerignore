@@ -15,6 +15,7 @@ memory_user_context.json
 frontend/node_modules/
 frontend/dist/
 uploaded_docs/
+runtime_data/
 .cache/
 .git/
 .gitignore

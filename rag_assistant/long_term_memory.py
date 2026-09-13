@@ -84,10 +84,16 @@ class LongTermMemory:
                 mem_type TEXT NOT NULL,
                 content TEXT NOT NULL,
                 confidence REAL DEFAULT 1.0,
+                weight REAL DEFAULT 1.0,
                 created_at TEXT,
                 updated_at TEXT
             )
         """)
+        # 兼容存量库：缺少 weight 列则补上（ALTER 在列已存在时抛错，忽略即可）
+        try:
+            conn.execute("ALTER TABLE memory ADD COLUMN weight REAL DEFAULT 1.0")
+        except Exception:
+            pass
         conn.execute("CREATE INDEX IF NOT EXISTS idx_user ON memory(user_id)")
         conn.commit()
         conn.close()
@@ -104,29 +110,95 @@ class LongTermMemory:
         )
 
     # ── 内部工具 ────────────────────────────────────────────
+    @staticmethod
+    def _normalize(content: str) -> str:
+        """实体文本归一化：去首尾空白、全角空格转半角、连续空白折叠、统一小写。"""
+        import re
+        s = (content or "").strip().replace("　", " ")
+        s = re.sub(r"\s+", " ", s)
+        return s.strip().lower()
+
+    @classmethod
+    def _entity_id(cls, user_id, content) -> str:
+        """实体 ID（稳定）：同用户 + 同归一化内容 → 永远同一个 ID。
+
+        与旧的「事件 ID」区别：**不含时间戳**——同一实体重复出现时能识别为同一条，
+        从而支持权重的正向累加（详见 技术文档/长期记忆.md 9.7）。
+        """
+        norm = cls._normalize(content)
+        return hashlib.md5(f"{user_id}|{norm}".encode()).hexdigest()[:16]
+
     def _mem_id(self, user_id, content):
-        return hashlib.md5(f"{user_id}|{content}|{_now_iso()}".encode()).hexdigest()[:16]
+        """[保留兼容] 旧的「事件 ID」入口，现委托给稳定的实体 ID。"""
+        return self._entity_id(user_id, content)
 
     def _sqlite(self):
         return sqlite3.connect(self._db_path)
 
-    def _upsert(self, mem_id, user_id, mem_type, content, confidence, created_at):
+    def _upsert(self, mem_id, user_id, mem_type, content, confidence, created_at, weight=1.0):
         now = _now_iso()
-        # SQLite
+        created = created_at or now
+        # SQLite：显式列名，兼容存量库 ALTER 后的物理列序
         conn = self._sqlite()
         conn.execute(
-            "INSERT OR REPLACE INTO memory VALUES (?,?,?,?,?,?,?)",
-            (mem_id, user_id, mem_type, content, confidence, created_at or now, now),
+            "INSERT OR REPLACE INTO memory "
+            "(id, user_id, mem_type, content, confidence, weight, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (mem_id, user_id, mem_type, content, confidence, weight, created, now),
         )
         conn.commit()
         conn.close()
-        # Chroma
-        self._vs.add_texts(
-            texts=[content],
-            metadatas=[{"user_id": user_id, "mem_type": mem_type,
-                        "confidence": confidence, "created_at": created_at or now}],
-            ids=[mem_id],
-        )
+        # Chroma：先删后加，保证同 ID 幂等更新（跨 langchain-chroma 版本安全）
+        # 向量写入失败静默降级（SQLite 已落盘，下次强化同实体时会重试 Chroma），
+        # 呼应模块文档「全程降级安全，绝不阻断主对话」。
+        try:
+            self._vs.delete(ids=[mem_id])
+        except Exception:
+            pass
+        try:
+            self._vs.add_texts(
+                texts=[content],
+                metadatas=[{"user_id": user_id, "mem_type": mem_type,
+                            "confidence": confidence, "weight": weight,
+                            "created_at": created}],
+                ids=[mem_id],
+            )
+        except Exception as e:
+            logger.warning(f"向量库写入失败(降级，SQLite 已落盘): {e}")
+
+    def _get_by_id(self, entity_id):
+        """按实体 ID 精确查一条记忆，返回 dict 或 None。"""
+        try:
+            conn = self._sqlite()
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT id, user_id, mem_type, content, confidence, weight, created_at "
+                "FROM memory WHERE id=?", (entity_id,),
+            ).fetchone()
+            conn.close()
+            if row:
+                return dict(row)
+        except Exception:
+            pass
+        return None
+
+    def _find_similar(self, user_id, content, dedup_sim):
+        """语义查同用户最近似的一条记忆（复用向量检索），命中返回 dict 或 None。"""
+        try:
+            hits = self._vs.similarity_search_with_score(
+                content, k=1, filter={"user_id": user_id}
+            )
+        except Exception as e:
+            logger.debug(f"语义去重跳过: {e}")
+            return None
+        if not hits:
+            return None
+        dist = float(hits[0][1])
+        rel = 1.0 / (1.0 + max(dist, 0.0))
+        if rel < dedup_sim:
+            return None
+        # 用近似内容的归一化结果定位已有实体的 ID
+        return self._get_by_id(self._entity_id(user_id, hits[0][0].page_content))
 
     def _delete(self, mem_id):
         try:
@@ -142,28 +214,40 @@ class LongTermMemory:
             pass
 
     # ── 存储（去重更新）──────────────────────────────────────
-    def _store_one(self, user_id, mem_type, content, confidence=1.0):
-        """存一条记忆，先做同用户去重：相似度高则更新覆盖，否则新增。"""
+    def _store_one(self, user_id, mem_type, content, confidence=1.0, delta=1.0):
+        """存一条记忆：实体 ID 去重 + 权重正向强化（替代旧的「删旧存新」）。
+
+        1. 按实体 ID（user_id + 归一化内容）精确查
+        2. 未命中则语义查近似实体（MEMORY_DEDUP_SIM 阈值）
+        3. 命中任一 → weight += delta（正向强化）+ 刷新时间戳，**不删旧记录**
+        4. 都未命中 → 新增记录，weight = 初始值 1.0
+        """
         cfg = _cfg()
         dedup_sim = getattr(cfg, "MEMORY_DEDUP_SIM", 0.85)
         content = (content or "").strip()
         if not content:
             return
-        try:
-            # 去重：同 user 语义检索最近似的一条（距离转相关度）
-            hits = self._vs.similarity_search_with_score(
-                content, k=1, filter={"user_id": user_id}
+
+        entity_id = self._entity_id(user_id, content)
+        existing = self._get_by_id(entity_id) or self._find_similar(
+            user_id, content, dedup_sim
+        )
+
+        if existing:
+            # 权重正向强化：保留累积价值，而非删旧存新
+            new_weight = float(existing.get("weight") or 1.0) + delta
+            self._upsert(
+                existing["id"], user_id,
+                existing.get("mem_type") or mem_type,
+                existing.get("content") or content,
+                float(existing.get("confidence") or confidence),
+                existing.get("created_at"),
+                weight=new_weight,
             )
-            if hits:
-                dist = float(hits[0][1])
-                rel = 1.0 / (1.0 + max(dist, 0.0))
-                if rel >= dedup_sim:
-                    self._delete_by_content(user_id, hits[0][0].page_content)
-                    _log(f"去重更新: {content[:30]}")
-        except Exception as e:
-            logger.debug(f"去重检查跳过: {e}")
-        mem_id = self._mem_id(user_id, content)
-        self._upsert(mem_id, user_id, mem_type, content, confidence, _now_iso())
+            _log(f"权重强化: {content[:30]} → weight={new_weight:.2f}")
+        else:
+            self._upsert(entity_id, user_id, mem_type, content, confidence,
+                         _now_iso(), weight=1.0)
 
     def _delete_by_content(self, user_id, content):
         """按内容删除旧记忆（去重更新用）。"""
@@ -201,6 +285,57 @@ class LongTermMemory:
                 self._store_one(user_id, "conclusion", summary, 0.6)
         except Exception as e:
             _log(f"抽取存储失败(忽略): {e}")
+
+    def extract_from_summary(self, user_id, summary) -> list:
+        """从会话摘要抽取长期有效记忆（摘要驱动，替代「每轮原始对话抽取」）。
+
+        与 extract_and_store 的区别：
+        - 抽取源是「已过滤的摘要」而非原始对话 → 信噪比更高
+        - 抽取口径只保留长期有效信息（偏好/固定约束/业务规则/高频工具经验）
+        - 触发频率为每 N 轮一次（随摘要更新），而非每轮 → 更省
+
+        去重与权重强化由 _store_one 承担（已存在则 weight += delta）。
+        全程降级安全：任何失败静默返回 []。
+        """
+        if not self._ensure():
+            return []
+        summary = (summary or "").strip()
+        if not summary:
+            return []
+        user_id = user_id or "default"
+
+        try:
+            from config import LLM_MODEL, MEMORY_EXTRACT_MAX_TOKENS
+            from mcp_unified_agent.prompt_templates import build_memory_extract_prompt
+        except Exception as e:
+            _log(f"摘要抽取依赖缺失(跳过): {e}")
+            return []
+
+        try:
+            prompt = build_memory_extract_prompt(summary)
+            resp = self._llm_client().chat.completions.create(
+                model=LLM_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                max_tokens=MEMORY_EXTRACT_MAX_TOKENS,
+            )
+            try:
+                from token_tracker import get_tracker
+                get_tracker().record(LLM_MODEL, resp.usage,
+                                     call_site="memory.extract_summary")
+            except Exception:
+                pass
+            text = (resp.choices[0].message.content or "").strip()
+            items = self._parse_json_array(text)
+            for it in items:
+                self._store_one(user_id, it.get("mem_type", "entity"),
+                                it.get("content", ""), it.get("confidence", 0.8))
+            if items:
+                _log(f"摘要抽取 {len(items)} 条长期记忆(user={user_id})")
+            return items
+        except Exception as e:
+            _log(f"摘要抽取失败(忽略): {e}")
+            return []
 
     def _llm_client(self):
         from openai import OpenAI
@@ -289,8 +424,9 @@ class LongTermMemory:
             mtype = m.get("mem_type", "conclusion")
             conf = float(m.get("confidence", 1.0) or 1.0)
             decay = self._decay(m.get("created_at"), decay_days)
+            mem_weight = float(m.get("weight", 1.0) or 1.0)  # 累积权重（正向强化）
             rel = 1.0 / (1.0 + max(float(dist), 0.0))   # 距离 → 0~1 相关度
-            weight = rel * type_w.get(mtype, 0.4) * conf * decay
+            weight = rel * type_w.get(mtype, 0.4) * conf * decay * mem_weight
             scored.append((weight, mtype, doc.page_content))
         scored.sort(key=lambda x: x[0], reverse=True)
 
@@ -342,6 +478,101 @@ class LongTermMemory:
             _log(f"清理失败: {e}")
             return 0
 
+    # ── 存量迁移：事件 ID → 实体 ID ─────────────────────────
+    def migrate_to_entity_id(self, dry_run: bool = False) -> dict:
+        """存量迁移：重算实体 ID、合并重复实体、合并权重。
+
+        背景：旧版 ID 含时间戳（「事件 ID」），同一实体重复出现会存成多条，
+        权重无法累加。迁移后同实体合并为一条，weight 累加、时间戳取最早。
+
+        Args:
+            dry_run: True=只统计不写入
+
+        Returns:
+            {"scanned": 扫描数, "merged": 合并掉的重复数, "written": 写入数, "dry_run": bool}
+        """
+        if not self._ensure():
+            return {"scanned": 0, "merged": 0, "written": 0, "error": "记忆未启用"}
+        try:
+            conn = self._sqlite()
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT id, user_id, mem_type, content, confidence, weight, created_at "
+                "FROM memory"
+            ).fetchall()
+        except Exception as e:
+            return {"scanned": 0, "merged": 0, "written": 0, "error": str(e)}
+
+        merged: dict[str, dict] = {}
+        old_ids: list[str] = []
+        for row in rows:
+            r = dict(row)
+            old_ids.append(r["id"])
+            nid = self._entity_id(r["user_id"], r["content"])
+            if nid in merged:
+                m = merged[nid]
+                m["weight"] += float(r.get("weight") or 1.0)          # 权重合并
+                m["confidence"] = max(m["confidence"], float(r.get("confidence") or 1.0))
+                # 时间戳取最早（保留实体的首次出现时间，利于时间衰减语义）
+                if r.get("created_at") and (
+                    not m["created_at"] or r["created_at"] < m["created_at"]
+                ):
+                    m["created_at"] = r["created_at"]
+            else:
+                merged[nid] = {
+                    "id": nid,
+                    "user_id": r["user_id"],
+                    "mem_type": r["mem_type"],
+                    "content": r["content"],
+                    "confidence": float(r.get("confidence") or 1.0),
+                    "weight": float(r.get("weight") or 1.0),
+                    "created_at": r.get("created_at"),
+                }
+
+        scanned, written = len(rows), len(merged)
+        result = {"scanned": scanned, "merged": scanned - written,
+                  "written": written, "dry_run": dry_run}
+        if dry_run:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return result
+
+        try:
+            # SQLite：清空后按合并结果重建
+            conn.execute("DELETE FROM memory")
+            for m in merged.values():
+                conn.execute(
+                    "INSERT OR REPLACE INTO memory "
+                    "(id, user_id, mem_type, content, confidence, weight, created_at, updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (m["id"], m["user_id"], m["mem_type"], m["content"],
+                     m["confidence"], m["weight"], m["created_at"], _now_iso()),
+                )
+            conn.commit()
+            conn.close()
+
+            # Chroma：删旧 ID、写新 ID
+            try:
+                self._vs.delete(ids=old_ids)
+            except Exception:
+                pass
+            for m in merged.values():
+                self._vs.add_texts(
+                    texts=[m["content"]],
+                    metadatas=[{"user_id": m["user_id"], "mem_type": m["mem_type"],
+                                "confidence": m["confidence"], "weight": m["weight"],
+                                "created_at": m["created_at"]}],
+                    ids=[m["id"]],
+                )
+            _log(f"迁移完成: 扫描 {scanned} 条 → 合并为 {written} 条"
+                 f"（消除重复 {scanned - written} 条）")
+        except Exception as e:
+            _log(f"迁移写入失败: {e}")
+            result["error"] = str(e)
+        return result
+
 
 def get_memory():
     return LongTermMemory.get()
@@ -350,6 +581,14 @@ def get_memory():
 # ── 自测 ──
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8")
+
+    # 存量迁移入口：python long_term_memory.py migrate [--dry-run]
+    if len(sys.argv) > 1 and sys.argv[1] == "migrate":
+        _m = get_memory()
+        _res = _m.migrate_to_entity_id(dry_run="--dry-run" in sys.argv)
+        print(f"迁移结果: {_res}")
+        sys.exit(0)
+
     print("=== 长期记忆自测 ===")
     m = get_memory()
     # 直接存(绕过 LLM 抽取)

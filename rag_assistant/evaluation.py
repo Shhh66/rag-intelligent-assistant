@@ -5,6 +5,13 @@ import os
 from datetime import datetime
 from pathlib import Path
 
+# 先触发 config 加载（内部 load_dotenv 注入 .env），否则本模块先于 config 被导入时
+# RUNTIME_DATA_DIR 还没进环境变量，路径会退回 CWD
+try:
+    import config as _config  # noqa: F401
+except Exception:
+    pass
+
 # 默认日志路径：设了 RUNTIME_DATA_DIR 就放进去（Docker 挂载卷持久化），
 # 否则用 CWD 下的相对路径（原行为）
 _RUNTIME_DIR = os.getenv("RUNTIME_DATA_DIR", "")

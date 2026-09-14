@@ -71,6 +71,11 @@ def _fake_llm(content=FAKE_SUMMARY, exc=None):
     return _f
 
 
+def _of(site):
+    """按 call_site 过滤调用记录（校验/重压会追加调用，不能再用 _calls[-1] 定位）。"""
+    return [c for c in _calls if c["call_site"] == site]
+
+
 def _new_agent():
     """绕过 __init__（避免真实 LLM/MCP 初始化），只装配测试所需属性。"""
     a = UnifiedAgent.__new__(UnifiedAgent)
@@ -103,9 +108,9 @@ def test_normal_compress():
 
     check(a._session_summary == FAKE_SUMMARY, f"摘要已写入（{a._session_summary[:20]}…）")
     check(len(a._history) == 10, f"历史裁剪到 KEEP_RECENT=10（实际 {len(a._history)}）")
-    check(bool(_calls) and _calls[-1]["call_site"] == "memory.compress",
+    check(len(_of("memory.compress")) == 1,
           "调用点标记为 memory.compress（可被 token 记账归因）")
-    check(_calls[-1]["max_tokens"] == 2000, "max_tokens=2000（推理模型需给足）")
+    check(_of("memory.compress")[-1]["max_tokens"] == 2000, "max_tokens=2000（推理模型需给足）")
     check("q0" not in str(a._history), "最早期对话已从窗口移除（其信息进入摘要）")
 
 
@@ -122,7 +127,7 @@ def test_rolling_compress():
     _fill(a, 10, prefix="r")
     a._record_conversation("q2", "a2")
 
-    check(first in _calls[-1]["prompt"], "第二次压缩的 Prompt 含第一次摘要（滚动合并）")
+    check(first in _of("memory.compress")[-1]["prompt"], "第二次压缩的 Prompt 含第一次摘要（滚动合并）")
     check(a._session_summary.startswith("第二版摘要"), "摘要已更新为新版本")
     check(len(a._history) == 10, "窗口再次回落到 10 条（长度恒定，不膨胀）")
 
@@ -151,7 +156,7 @@ def test_boundary_one_over():
     _fill(a, 10)
     a._record_conversation("q", "a")   # → 22 条
     check(a._session_summary != "", "触发压缩，摘要已写入")
-    check(len(_calls) == 1, f"恰好调用 1 次 LLM（实际 {len(_calls)}）")
+    check(len(_of("memory.compress")) == 1, f"恰好压缩 1 次（实际 {len(_of('memory.compress'))}）")
 
 
 def test_boundary_keep_recent_config():

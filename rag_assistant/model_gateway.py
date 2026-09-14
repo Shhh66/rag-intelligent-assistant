@@ -10,13 +10,18 @@
   unified_agent._pipeline 循环里新增一段预算检查。
 - MODEL_ROUTE 为空 / TASK_TOKEN_BUDGET=0 时，行为与改造前完全一致。
 
-说明：当前 DeepSeek 的 chat/flash 同价，模型路由暂时省不了钱，它是「框架就位、
-价差预留」——未来接入有价差的模型（deepseek-reasoner 贵 / 便宜开源模型）即生效。
-当前真正省钱的是「单任务 Token 预算」防 token 爆炸。
+说明：当前 `deepseek-flash` 既是唯一在用模型、也是性价比最优的一档
+（V4.1-Flash 在并发 2500 与图像理解上均优于 v4-pro 的 500 / 不支持，价格还更低），
+因此 `MODEL_ROUTE` 默认留空、不做路由 —— 「强推理切 v4-pro」没有必要。
+
+路由机制保留：将来接入第二个模型（其他厂商 / 本地模型 / 更便宜的小模型）时，
+填 `MODEL_ROUTE` 即生效，无需改代码。
+
+当前真正在起作用的成本控制是「单任务 Token 预算」——防多轮 ReAct 循环把 token 打爆。
 
 用法：
     from model_gateway import route_model, check_budget
-    model = route_model("decision_engine.match_skill", "deepseek-v4-flash")
+    model = route_model("decision_engine.match_skill", "deepseek-flash")
     exceeded = check_budget(8000)
 """
 
@@ -71,20 +76,18 @@ if __name__ == "__main__":
 
     # 1. 模型路由：未配置 → 默认模型
     print("[1] 模型路由（未配置路由表 → 用默认模型）:")
-    print(f"    match_skill → {route_model('decision_engine.match_skill', 'deepseek-v4-flash')}")
+    print(f"    match_skill → {route_model('decision_engine.match_skill', 'deepseek-flash')}")
 
-    # 2. 模拟配置路由
+    # 2. 模拟配置路由（仅演示机制：当前无第二个模型可路由，用占位名示意）
     import config
     config.MODEL_ROUTE = {
-        "decision_engine.match_skill": "deepseek-chat",   # 简单任务 → 小模型
-        "judge.evaluate": "deepseek-chat",                # 简单判断 → 小模型
-        "decision_engine.decide": "deepseek-v4-flash",    # 强推理 → 大模型
+        "decision_engine.match_skill": "cheap-model-A",   # 示例：简单任务 → 某个便宜模型
+        "judge.evaluate": "cheap-model-A",                # 示例：简单判断 → 某个便宜模型
     }
-    print("\n[2] 配置路由后（简单任务 → deepseek-chat，强推理 → flash）:")
-    print(f"    match_skill → {route_model('decision_engine.match_skill', 'deepseek-v4-flash')}")
-    print(f"    judge       → {route_model('judge.evaluate', 'deepseek-v4-flash')}")
-    print(f"    decide      → {route_model('decision_engine.decide', 'deepseek-v4-flash')}")
-    print(f"    未配置站点   → {route_model('unknown.site', 'deepseek-v4-flash')}（回退默认）")
+    print("\n[2] 配置路由后（演示机制：命中路由表用映射值，未命中回退默认）:")
+    print(f"    match_skill → {route_model('decision_engine.match_skill', 'deepseek-flash')}")
+    print(f"    judge       → {route_model('judge.evaluate', 'deepseek-flash')}")
+    print(f"    decide      → {route_model('decision_engine.decide', 'deepseek-flash')}（未配置 → 回退默认）")
 
     # 3. token 预算边界
     print("\n[3] Token 预算边界:")
@@ -108,7 +111,7 @@ if __name__ == "__main__":
                 self.completion_tokens = c
                 self.total_tokens = t
 
-        tracker.record("deepseek-v4-flash", MockUsage(5000, 1000, 6000), call_site="test")
+        tracker.record("deepseek-flash", MockUsage(5000, 1000, 6000), call_site="test")
         used = tracker.get_conversation_diff()["total_tokens"]
         print(f"    累计 token = {used}")
         print(f"    check_budget(4000) = {check_budget(4000)}（超 4000 → 应 True）")

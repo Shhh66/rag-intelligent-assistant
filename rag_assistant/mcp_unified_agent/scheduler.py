@@ -109,6 +109,20 @@ class Scheduler:
 
         # 0. 工具级权限校验（收口，fail-closed：未声明权限的敏感工具默认拒绝）
         if self.tool_perm_enabled and self.permissions is not None:
+            # 先区分「工具不存在」与「权限不足」：两者都 fail-closed，
+            # 但混报成「权限拒绝」会把排查方向引向 RBAC ——
+            # 实际原因通常是 LLM 编了工具名（如把 Skill 名当工具调）。
+            if self.registry.get(decision.tool_name) is None:
+                latency = (time.time() - start) * 1000
+                self._audit(decision, "", False, latency,
+                            error=f"工具不存在: {decision.tool_name}")
+                return {
+                    "tool_name": decision.tool_name,
+                    "arguments": decision.arguments,
+                    "result": f"工具不存在: {decision.tool_name}（不在已注册的 MCP 工具中）",
+                    "is_error": True,
+                    "latency_ms": round(latency, 2),
+                }
             denied = self._check_tool_permission(decision.tool_name)
             if denied:
                 return {

@@ -41,7 +41,7 @@ def _call_llm(messages, temperature, max_tokens, call_site, timeout=30.0):
 def _translate_query_for_search(query: str) -> str:
     """将中文查询翻译为英文关键词，提升英文文档检索命中率。
 
-    注意：LLM_MODEL(deepseek-v4-flash) 是推理模型，会先输出 reasoning_content，
+    注意：LLM_MODEL(deepseek-flash) 是推理模型，会先输出 reasoning_content，
     max_tokens 过小会导致正式 content 为空。故给足 512 token 空间。
     """
     resp = _call_llm(

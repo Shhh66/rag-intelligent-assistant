@@ -340,6 +340,74 @@ def build_session_summary_prompt(
     )
 
 
+# ── 摘要校验 Prompt（压缩后比对原文，找出丢失的关键信息）─────────
+
+SUMMARY_VERIFY_PROMPT = """你是一个摘要质量校验器。判断下面的【摘要】是否完整保留了【原始对话】中的关键信息。
+
+## 原始对话
+{dialogue}
+
+## 摘要
+{summary}
+
+## 关键信息定义（缺少任一即算不完整）
+- 用户的核心诉求与目标
+- 已确认的结论 / 决策 / 约束（如"只用中文回答"、"排除某部门文档"）
+- 未完成的待办与进行中的任务
+- 关键实体（项目名、专有名词、数字）
+
+## 输出格式
+只输出 JSON，不要解释：
+{{"ok": true 或 false, "missing": ["缺失的关键信息1", "缺失的关键信息2"]}}
+- ok=true：关键信息均已保留（missing 给空数组）
+- ok=false：有遗漏，missing 逐条列出【摘要中丢失、但原文里有】的关键信息（每条一句话）
+
+## JSON："""
+
+
+def build_summary_verify_prompt(dialogue: str, summary: str) -> str:
+    """构建摘要校验 Prompt（比对原文与摘要，找出遗漏的关键信息）。"""
+    return SUMMARY_VERIFY_PROMPT.format(dialogue=dialogue, summary=summary)
+
+
+# ── 摘要定向重压 Prompt（校验发现遗漏后，带着缺失项重压一次）────
+
+SUMMARY_RETRY_PROMPT = """你是一个对话摘要压缩器。上一次的摘要遗漏了关键信息，请重新压缩并补全。
+
+## 已有摘要（需与新内容合并）
+{existing_summary}
+
+## 待压缩的对话
+{dialogue}
+
+## ⚠️ 上一次遗漏的关键信息（必须补进新摘要）
+{missing}
+
+## 压缩要求
+1. **必须保留**：用户的核心诉求与目标、已确认的结论/决策/约束、未完成的待办、关键实体（项目名、专有名词、数字）
+2. **必须补全**：上面列出的「上一次遗漏的关键信息」
+3. **可以丢弃**：寒暄、重复确认、失败尝试的中间过程
+4. 输出长度控制在约 {target_tokens} token
+5. 用陈述句写摘要，直接输出摘要正文，不要 JSON、不要解释、不要加标题
+
+## 摘要："""
+
+
+def build_summary_retry_prompt(
+    existing_summary: str,
+    dialogue: str,
+    missing: list,
+    target_tokens: int = 800,
+) -> str:
+    """构建定向重压 Prompt（把校验发现的缺失项显式喂回，要求补全）。"""
+    return SUMMARY_RETRY_PROMPT.format(
+        existing_summary=existing_summary or "（无，这是首次压缩）",
+        dialogue=dialogue,
+        missing="\n".join(f"- {m}" for m in (missing or [])) or "（无）",
+        target_tokens=target_tokens,
+    )
+
+
 # ── 长期记忆抽取 Prompt（从会话摘要中提长期有效信息）──────────
 
 MEMORY_EXTRACT_PROMPT = """你是一个长期记忆抽取器。从下面的会话摘要中，只抽取【长期有效】的用户信息。

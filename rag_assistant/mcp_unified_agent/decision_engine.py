@@ -136,6 +136,31 @@ SKILL_MATCH_RESPONSE_FORMAT_FALLBACK = {
     "type": "json_object",
 }
 
+# ── json_schema（Structured Outputs）支持性探测缓存 ──────────────
+# DeepSeek 等 API 不支持 json_schema，首次请求必返 400。
+# 用模块级标记记住探测结果，避免每次调用都白发一个注定失败的请求
+# （原先每轮 ReAct 决策 / 每次 Skill 匹配都要多一次 400 往返）。
+# None = 尚未探测；True = 支持；False = 不支持（之后直接用 json_object）。
+_JSON_SCHEMA_SUPPORTED: bool | None = None
+
+
+def _is_json_schema_unavailable(err_msg: str) -> bool:
+    """判断异常信息是否为「json_schema 类型当前不可用」。"""
+    return "response_format" in err_msg and "unavailable" in err_msg
+
+
+def _mark_json_schema_unsupported() -> None:
+    """首次探测到不支持后置位；后续调用直接走 fallback，不再空试一次。"""
+    global _JSON_SCHEMA_SUPPORTED
+    if _JSON_SCHEMA_SUPPORTED is not False:
+        _JSON_SCHEMA_SUPPORTED = False
+        logger.info("已记录：当前 API 不支持 json_schema，后续直接使用 json_object")
+
+
+def _pick_response_format(strict: dict, fallback: dict) -> dict:
+    """按探测结果选 response_format：已知不支持时直接用 fallback。"""
+    return fallback if _JSON_SCHEMA_SUPPORTED is False else strict
+
 
 @dataclass
 class ToolDecision:
@@ -392,7 +417,9 @@ class DecisionEngine:
             {"role": "user", "content": prompt},
         ]
 
-        response_format = SKILL_MATCH_RESPONSE_FORMAT_STRICT
+        response_format = _pick_response_format(
+            SKILL_MATCH_RESPONSE_FORMAT_STRICT, SKILL_MATCH_RESPONSE_FORMAT_FALLBACK
+        )
 
         for attempt in range(2):  # 解析失败允许重试 1 次
             try:
@@ -421,8 +448,9 @@ class DecisionEngine:
             except Exception as e:
                 err_msg = str(e)
                 # json_schema 不支持时降级到 json_object
-                if "response_format" in err_msg and "unavailable" in err_msg:
+                if _is_json_schema_unavailable(err_msg):
                     logger.warning(f"json_schema 不支持，降级到 json_object: {e}")
+                    _mark_json_schema_unsupported()
                     response_format = SKILL_MATCH_RESPONSE_FORMAT_FALLBACK
                     continue
                 logger.error(f"Skill 匹配 LLM 调用失败: {e}")
@@ -521,15 +549,12 @@ class DecisionEngine:
         else:
             skills_description = ""
 
-        # 可用工具列表里也注入 Skill 名（让 ReAct 可以调 Skill）
-        if skills_candidates:
-            skill_tool_lines = ["\n## 可调用的技能（作为高级工具使用）"]
-            for s in skills_candidates:
-                skill_tool_lines.append(
-                    f"### {s['name']}\n描述：{s['description']}\n"
-                    f"参数：{', '.join(s.get('arg_slots', {}).keys())}"
-                )
-            tools_description += "\n".join(skill_tool_lines)
+        # 【已移除】曾把 Skill 名注入「可用工具」列表（标题「可调用的技能（作为高级工具使用）」），
+        # 想让 ReAct 循环能调 Skill。但 LLM 输出的 action 只有 call_tools / direct_answer
+        # （见 REACT_DECISION_SCHEMA 的 enum），call_skill 分支不可达 —— 于是 LLM 只能用
+        # call_tools 去调 Skill 名（deep_kb_search / weather_advice），而它们不在 MCP 工具
+        # 注册表里，必然报「工具不存在」。Skill 的正确入口是 unified_agent 的前置匹配
+        # （SkillRegistry.match → LLM 确认 → SkillExecutor），不经过 ReAct 循环。
 
         prompt = build_decision_prompt(
             user_input=user_input,
@@ -547,7 +572,9 @@ class DecisionEngine:
         ]
 
         raw_text = ""
-        response_format = REACT_RESPONSE_FORMAT_STRICT
+        response_format = _pick_response_format(
+            REACT_RESPONSE_FORMAT_STRICT, REACT_RESPONSE_FORMAT_FALLBACK
+        )
 
         for attempt in range(2):
             try:
@@ -575,8 +602,9 @@ class DecisionEngine:
             except Exception as e:
                 err_msg = str(e)
                 # json_schema 不支持时降级到 json_object
-                if "response_format" in err_msg and "unavailable" in err_msg:
+                if _is_json_schema_unavailable(err_msg):
                     logger.warning(f"json_schema 不支持，降级到 json_object: {e}")
+                    _mark_json_schema_unsupported()
                     response_format = REACT_RESPONSE_FORMAT_FALLBACK
                     continue
                 logger.error(f"ReAct 决策调用失败: {e}")

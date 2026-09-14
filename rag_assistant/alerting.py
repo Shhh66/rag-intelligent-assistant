@@ -26,6 +26,13 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# 先触发 config 加载（内部 load_dotenv 注入 .env），否则本模块先于 config 被导入时
+# RUNTIME_DATA_DIR 还没进环境变量，路径会退回项目目录
+try:
+    import config as _config  # noqa: F401
+except Exception:
+    pass
+
 # 告警落盘文件：设了 RUNTIME_DATA_DIR 就放进去（Docker 挂载卷持久化），
 # 否则用项目目录（原行为）
 _ALERT_FILE = Path(

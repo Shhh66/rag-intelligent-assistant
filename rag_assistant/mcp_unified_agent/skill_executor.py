@@ -189,6 +189,11 @@ class SkillExecutor:
 
         # 工具级权限校验（Skill 路径收口，与 scheduler 一致）
         if self.permissions is not None and self.registry is not None:
+            # 先区分「工具不存在」与「权限不足」（同 scheduler：避免误导成 RBAC 问题）
+            if self.registry.get(tool_name) is None:
+                self._log("tool_missing", f"步骤 {index}: 工具不存在 {tool_name}")
+                return self._error_result(tool_name, filled_args, is_critical,
+                                          f"工具不存在: {tool_name}（不在已注册的 MCP 工具中）")
             denied = self._check_tool_permission(tool_name)
             if denied:
                 self._log("perm_denied", f"步骤 {index}: {tool_name} 权限拒绝: 缺 {denied}")

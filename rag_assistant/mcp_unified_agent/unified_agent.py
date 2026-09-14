@@ -14,6 +14,7 @@ MCP 连接 → 流水线 → 断开连接周期，避免跨事件循环问题。
 """
 
 import asyncio
+import json
 import logging
 import sys
 import time
@@ -27,7 +28,11 @@ from mcp import ClientSession, StdioServerParameters
 
 from .mcp_client_manager import MCPSession
 from .circuit_breaker import CircuitBreakerError, call_llm_with_cb
-from .prompt_templates import build_session_summary_prompt
+from .prompt_templates import (
+    build_session_summary_prompt,
+    build_summary_verify_prompt,
+    build_summary_retry_prompt,
+)
 from rate_limiter import RateLimitError
 from .tool_registry import ToolRegistry
 from .decision_engine import DecisionEngine, SkillMatchResult
@@ -408,9 +413,6 @@ class UnifiedAgent:
                     )
 
         # ═══ 步骤 1-N：ReAct 推理循环（五阶段版本） ═══
-        skills_list = (
-            self._skill_registry.get_all() if self._skill_registry else []
-        )
 
         # 五阶段状态
         current_plan = ""  # 首轮规划，后续轮次注入
@@ -459,16 +461,15 @@ class UnifiedAgent:
                     )
 
             # 3. LLM 决策（五阶段：Plan → Thought → Action → Observation → Evaluation → Decision）
-            # 首轮传入 Skill 候选，后续轮次仅 tool（已有结果回填）
-            skill_candidates_for_turn = (
-                [s for s in skills_list] if turn == 0 and skills_list else None
-            )
+            # 不注入 Skill 候选：Skill 入口是上面的「前置匹配」，ReAct 循环内调不动 Skill
+            # （action 枚举只有 call_tools/direct_answer，call_skill 分支不可达）。
+            # 曾经把 Skill 当「高级工具」宣传给 LLM，导致它用 call_tools 调 Skill 名 → 必然失败。
             decision = decision_engine.decide_with_skills(
                 user_input=user_input,
                 history=self._history,
                 tools=candidate_tools,
                 reflection_hints=hints,
-                skills_candidates=skill_candidates_for_turn,
+                skills_candidates=None,
                 turn=turn,
                 current_plan=current_plan,
             )
@@ -556,7 +557,28 @@ class UnifiedAgent:
             )
             all_results.extend(results)
 
-            # 5b. 独立 Judge 模型判断信息是否足够（新增）
+            # 6. 记录反思
+            if self._reflection:
+                for i, tool_dec in enumerate(decision.tools):
+                    r = results[i] if i < len(results) else {}
+                    self._reflection.record(ReflectionEntry(
+                        query=user_input,
+                        selected_tool=tool_dec.tool_name,
+                        success=not r.get("is_error", True),
+                        result_preview=str(r.get("result", ""))[:200],
+                        latency_ms=r.get("latency_ms", 0),
+                    ))
+                # 6b. 短→长沉淀：某工具高频使用则沉淀为用户偏好（无需额外 LLM）
+                self._maybe_sediment_preference()
+
+            # ── 工具结果处理 ──
+            success_count = sum(1 for r in results if not r.get("is_error"))
+            all_failed = success_count == 0
+
+            # 5b. 独立 Judge 模型判断信息是否足够
+            # 位置说明：必须放在「记录反思」之后、`if not all_failed` 之前——
+            # 否则 Judge 说 No 只会打一行日志，紧接着被「任一工具成功即返回」覆盖，
+            # 判定形同虚设（位置错了，逻辑就等于没有）。
             from config import JUDGE_ENABLED
             if JUDGE_ENABLED:
                 try:
@@ -603,7 +625,7 @@ class UnifiedAgent:
 
                     if judge_result.is_sufficient:
                         logger.info(
-                            f"[Judge] Round {turn}: 信息足够，跳过主 LLM 决策，直接生成答案"
+                            f"[Judge] Round {turn}: 信息足够，直接生成答案"
                         )
                         answer = decision_engine.final_answer(
                             user_input=user_input,
@@ -612,30 +634,13 @@ class UnifiedAgent:
                         )
                         self._record_conversation(user_input, answer)
                         return answer
-                    else:
-                        logger.info(
-                            f"[Judge] Round {turn}: 信息不足，继续下一轮"
-                        )
+
+                    # 信息不足 → 真正进入下一轮继续收集
+                    logger.info(f"[Judge] Round {turn}: 信息不足，继续下一轮")
+                    continue
                 except Exception as e:
+                    # Judge 不可用 → 降级到原有逻辑（任一工具成功即汇总返回）
                     logger.warning(f"[Judge] 调用失败，降级到原有逻辑: {e}")
-
-            # 6. 记录反思
-            if self._reflection:
-                for i, tool_dec in enumerate(decision.tools):
-                    r = results[i] if i < len(results) else {}
-                    self._reflection.record(ReflectionEntry(
-                        query=user_input,
-                        selected_tool=tool_dec.tool_name,
-                        success=not r.get("is_error", True),
-                        result_preview=str(r.get("result", ""))[:200],
-                        latency_ms=r.get("latency_ms", 0),
-                    ))
-                # 6b. 短→长沉淀：某工具高频使用则沉淀为用户偏好（无需额外 LLM）
-                self._maybe_sediment_preference()
-
-            # ── 工具结果处理 ──
-            success_count = sum(1 for r in results if not r.get("is_error"))
-            all_failed = success_count == 0
 
             if not all_failed:
                 # 有至少一个工具成功：统一走 final_answer 汇总
@@ -704,6 +709,9 @@ class UnifiedAgent:
             keep = max(2, int(getattr(_cfg, "SESSION_SUMMARY_KEEP_RECENT", 10)))
             target = int(getattr(_cfg, "SESSION_SUMMARY_TARGET_TOKENS", 800))
             max_tokens = int(getattr(_cfg, "SESSION_SUMMARY_MAX_TOKENS", 2000))
+            verify_enabled = getattr(_cfg, "SESSION_SUMMARY_VERIFY_ENABLED", True)
+            verify_truncate = getattr(
+                _cfg, "SESSION_SUMMARY_VERIFY_FALLBACK_TRUNCATE", False)
         except Exception:
             return False
 
@@ -743,6 +751,20 @@ class UnifiedAgent:
             logger.warning(f"会话摘要压缩失败（回退硬截断）: {e}")
             return False
 
+        # 压缩后校验：比对原文，若摘要丢了关键信息 → 带缺失项定向重压一次
+        if verify_enabled:
+            missing = self._verify_summary(dialogue, summary)
+            if missing:
+                logger.info(f"摘要校验发现 {len(missing)} 项遗漏，定向重压")
+                retried = self._retry_compress(dialogue, missing, target, max_tokens)
+                if retried:
+                    summary = retried
+                elif verify_truncate:
+                    logger.warning("摘要校验未通过且重压失败，回退硬截断")
+                    return False
+                else:
+                    logger.warning("摘要校验未通过且重压失败，沿用原摘要（仍优于硬截断）")
+
         self._session_summary = summary
         self._history = recent_msgs
         logger.info(
@@ -750,6 +772,72 @@ class UnifiedAgent:
             f"（保留最近 {len(recent_msgs)} 条原文）"
         )
         return True
+
+    @staticmethod
+    def _parse_verify_json(text: str):
+        """从校验响应中提取 JSON 对象；无法解析返回 None。"""
+        if not text:
+            return None
+        start, end = text.find("{"), text.rfind("}")
+        if start == -1 or end <= start:
+            return None
+        try:
+            data = json.loads(text[start:end + 1])
+        except Exception:
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _verify_summary(self, dialogue: str, summary: str) -> list[str]:
+        """校验摘要是否丢失原文关键信息。
+
+        返回缺失项列表（供定向重压）；校验通过 / 无法判定 / 调用出错 一律返回 []。
+        即「校验本身失败不作为压缩失败的依据」——避免校验环节反而阻断主链路。
+        """
+        try:
+            import config as _cfg
+            max_tokens = int(getattr(_cfg, "SESSION_SUMMARY_VERIFY_MAX_TOKENS", 512))
+        except Exception:
+            max_tokens = 512
+        try:
+            prompt = build_summary_verify_prompt(dialogue, summary)
+            resp = call_llm_with_cb(
+                self._llm_client, self.model,
+                [{"role": "user", "content": prompt}],
+                temperature=0, max_tokens=max_tokens,
+                call_site="memory.verify",
+            )
+            text = (resp.choices[0].message.content or "").strip()
+            data = self._parse_verify_json(text)
+            if data is None:
+                logger.debug("摘要校验结果无法解析，跳过校验（不阻断）")
+                return []
+            if data.get("ok") is True:
+                return []
+            return [str(m) for m in (data.get("missing") or []) if str(m).strip()]
+        except Exception as e:
+            logger.warning(f"摘要校验调用失败（跳过校验，不阻断）: {e}")
+            return []
+
+    def _retry_compress(self, dialogue: str, missing: list[str],
+                        target: int, max_tokens: int) -> str:
+        """定向重压：把校验发现的缺失项喂回，要求补全。失败返回空串。"""
+        try:
+            prompt = build_summary_retry_prompt(
+                existing_summary=self._session_summary,
+                dialogue=dialogue,
+                missing=missing,
+                target_tokens=target,
+            )
+            resp = call_llm_with_cb(
+                self._llm_client, self.model,
+                [{"role": "user", "content": prompt}],
+                temperature=0.3, max_tokens=max_tokens,
+                call_site="memory.compress_retry",
+            )
+            return (resp.choices[0].message.content or "").strip()
+        except Exception as e:
+            logger.warning(f"摘要定向重压失败: {e}")
+            return ""
 
     def _record_conversation(self, user_input: str, answer: str) -> None:
         """记录一轮对话到历史。"""

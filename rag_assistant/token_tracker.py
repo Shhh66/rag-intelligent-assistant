@@ -25,17 +25,77 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# 先触发 config 加载：config 内部会 load_dotenv 把 .env 注入 os.environ。
+# 否则本模块若先于 config 被导入（如被 circuit_breaker 间接引入），
+# RUNTIME_DATA_DIR 还没进环境变量，下面的路径会退回项目目录 —— 曾因此导致
+# 日志分裂到两处（项目根目录 + runtime_data/）。
+try:
+    import config as _config  # noqa: F401
+except Exception:
+    pass
 
 # 持久化文件路径：设了 RUNTIME_DATA_DIR 就放进去（Docker 挂载卷持久化），
 # 否则用项目目录（原行为，容器重建会丢）
 _PERSIST_FILE = Path(
     os.getenv("RUNTIME_DATA_DIR") or Path(__file__).resolve().parent
 ) / "token_log.jsonl"
+
+# config 不可用时的兜底定价（结构须与 config.MODEL_PRICING 一致，按 Flash 空闲档）
+_FALLBACK_PRICING = {
+    "input_cache_hit":  {"off_peak": 0.02, "peak": 0.04},
+    "input_cache_miss": {"off_peak": 1.0,  "peak": 2.0},
+    "output":           {"off_peak": 4.0,  "peak": 8.0},
+}
+
+# 北京时间（DeepSeek 按时段计价，用固定偏移换算，不依赖运行机器时区）
+_BEIJING_TZ = timezone(timedelta(hours=8))
+
+
+def is_peak_hour(dt: Optional[datetime] = None) -> bool:
+    """是否处于 DeepSeek 高峰时段。
+
+    高峰 = 北京时间 周一至周五 9:00-12:00、14:00-18:00（其余为空闲档，价格减半）。
+    """
+    try:
+        from config import PEAK_HOURS_WEEKDAY
+        windows = PEAK_HOURS_WEEKDAY
+    except Exception:
+        windows = [(9, 12), (14, 18)]
+
+    now = dt.astimezone(_BEIJING_TZ) if dt else datetime.now(_BEIJING_TZ)
+    if now.weekday() >= 5:          # 5=周六, 6=周日 → 全天空闲
+        return False
+    return any(start <= now.hour < end for start, end in windows)
+
+
+def extract_cache_hit_tokens(usage) -> int:
+    """从 usage 中取「缓存命中」的输入 token 数。
+
+    DeepSeek 用 prompt_cache_hit_tokens；OpenAI 风格用 prompt_tokens_details.cached_tokens。
+    取不到时返回 0 —— 即全部按「未命中」计价，偏保守，不会低估成本。
+    """
+    if usage is None:
+        return 0
+    for attr in ("prompt_cache_hit_tokens", "cache_hit_tokens"):
+        v = getattr(usage, attr, None)
+        if isinstance(v, int):
+            return v
+    details = getattr(usage, "prompt_tokens_details", None)
+    if details is not None:
+        v = getattr(details, "cached_tokens", None)
+        if isinstance(v, int):
+            return v
+    if isinstance(usage, dict):          # dict 形态兜底
+        v = usage.get("prompt_cache_hit_tokens")
+        if isinstance(v, int):
+            return v
+    return 0
 
 
 @dataclass
@@ -48,6 +108,8 @@ class TokenUsage:
     cost_rmb: float = 0.0
     timestamp: str = ""
     call_site: str = ""
+    cache_hit_tokens: int = 0      # 输入中「缓存命中」的 token 数（按低价计）
+    is_peak: bool = False          # 是否按高峰价计费（便于审计成本口径）
 
 
 class TokenTracker:
@@ -101,7 +163,8 @@ class TokenTracker:
         prompt_tokens = getattr(usage, 'prompt_tokens', 0)
         completion_tokens = getattr(usage, 'completion_tokens', 0)
         total_tokens = getattr(usage, 'total_tokens', prompt_tokens + completion_tokens)
-        cost = self._calculate_cost(model, prompt_tokens, completion_tokens)
+        peak = is_peak_hour()
+        cost = self._calculate_cost(model, prompt_tokens, completion_tokens, usage)
 
         record = TokenUsage(
             model=model,
@@ -111,6 +174,8 @@ class TokenTracker:
             cost_rmb=cost,
             timestamp=datetime.now().isoformat(),
             call_site=call_site,
+            cache_hit_tokens=extract_cache_hit_tokens(usage),
+            is_peak=peak,
         )
 
         # 会话级累积
@@ -145,22 +210,41 @@ class TokenTracker:
 
         logger.debug(
             f"Token 记录 [{call_site}]: {model} "
-            f"in={prompt_tokens} out={completion_tokens} ¥{cost:.6f}"
+            f"in={prompt_tokens}(缓存命中 {record.cache_hit_tokens}) "
+            f"out={completion_tokens} "
+            f"{'高峰' if peak else '空闲'}档 ¥{cost:.6f}"
         )
         return record
 
     def _calculate_cost(
-        self, model: str, prompt_tokens: int, completion_tokens: int
+        self, model: str, prompt_tokens: int, completion_tokens: int, usage=None
     ) -> float:
-        """计算单次调用的费用（单位：人民币元）。"""
+        """计算单次调用的费用（单位：人民币元）。
+
+        按 DeepSeek 现行定价，两个维度影响单价：
+        - **时段**：高峰价 = 空闲价 × 2（北京时间 周一至周五 9-12 点、14-18 点）
+        - **输入缓存**：命中价远低于未命中，两者分开计价
+
+        usage 用于取「缓存命中 token 数」；取不到则全部按未命中计（偏保守）。
+        """
         try:
             from config import MODEL_PRICING, DEFAULT_PRICING
             pricing = MODEL_PRICING.get(model, DEFAULT_PRICING)
-        except ImportError:
-            pricing = {"input": 1.0, "output": 2.0}
+        except Exception:
+            pricing = _FALLBACK_PRICING
 
-        input_cost = (prompt_tokens / 1_000_000) * pricing.get("input", 1.0)
-        output_cost = (completion_tokens / 1_000_000) * pricing.get("output", 2.0)
+        slot = "peak" if is_peak_hour() else "off_peak"
+
+        # 缓存命中数做上下界防御：不应为负，也不应超过输入总数
+        hit = extract_cache_hit_tokens(usage)
+        hit = min(max(hit, 0), max(prompt_tokens, 0))
+        miss = max(prompt_tokens, 0) - hit
+
+        input_cost = (
+            miss / 1_000_000 * pricing["input_cache_miss"][slot]
+            + hit / 1_000_000 * pricing["input_cache_hit"][slot]
+        )
+        output_cost = (completion_tokens / 1_000_000) * pricing["output"][slot]
         return input_cost + output_cost
 
     # ── 对话边界管理 ────────────────────────────────────────────
@@ -367,6 +451,8 @@ class TokenTracker:
             "cost_rmb": round(record.cost_rmb, 6),
             "timestamp": record.timestamp,
             "call_site": record.call_site,
+            "cache_hit_tokens": record.cache_hit_tokens,
+            "is_peak": record.is_peak,
         }
 
     @property
@@ -422,15 +508,15 @@ if __name__ == "__main__":
 
     # ── 模拟第1轮对话 ──
     tracker.start_conversation()
-    tracker.record("deepseek-v4-flash", MockUsage(500, 200, 700), call_site="retriever.rag_answer")
-    tracker.record("deepseek-v4-flash", MockUsage(300, 50, 350), call_site="decision_engine.decide")
+    tracker.record("deepseek-flash", MockUsage(500, 200, 700), call_site="retriever.rag_answer")
+    tracker.record("deepseek-flash", MockUsage(300, 50, 350), call_site="decision_engine.decide")
 
     conv1 = tracker.get_conversation_diff()
     print(f"📝 第1轮对话增量: {conv1['total_tokens']} Token, ¥{conv1['total_cost']:.4f}")
 
     # ── 模拟第2轮对话 ──
     tracker.start_conversation()
-    tracker.record("deepseek-chat", MockUsage(1000, 400, 1400), call_site="decision_engine.final_answer")
+    tracker.record("deepseek-flash", MockUsage(1000, 400, 1400), call_site="decision_engine.final_answer")
 
     conv2 = tracker.get_conversation_diff()
     print(f"📝 第2轮对话增量: {conv2['total_tokens']} Token, ¥{conv2['total_cost']:.4f}")

@@ -27,7 +27,7 @@ OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
 GROQ_BASE_URL = "https://api.deepseek.com"
 
 # LLM 模型名称
-LLM_MODEL = "deepseek-v4-flash"
+LLM_MODEL = "deepseek-flash"
        
 
 # ===== HuggingFace 镜像配置 =====
@@ -53,6 +53,10 @@ SESSION_SUMMARY_ENABLED = True        # 压缩总开关（False=退回纯窗口�
 SESSION_SUMMARY_KEEP_RECENT = 10      # 压缩后保留的最近消息条数（原文保真）
 SESSION_SUMMARY_TARGET_TOKENS = 800   # 摘要目标长度（500~1000 token 区间中值）
 SESSION_SUMMARY_MAX_TOKENS = 2000     # 压缩调用 max_tokens（推理模型需给足，否则 content 空串）
+# 压缩后校验（防「压缩丢关键信息」）：校验不通过则带缺失项定向重压一次
+SESSION_SUMMARY_VERIFY_ENABLED = True        # 校验总开关（False=不校验，行为与改造前一致）
+SESSION_SUMMARY_VERIFY_MAX_TOKENS = 512      # 校验调用 max_tokens（输出短 JSON，给足防推理模型空串）
+SESSION_SUMMARY_VERIFY_FALLBACK_TRUNCATE = False  # True=校验+重压都失败则回退硬截断；False=仍用摘要（见文档对照节）
 
 # ===== 检索配置 =====
 TOP_K = 8                          # 每次检索返回 8 个最相关片段（需覆盖同名Section场景）
@@ -65,17 +69,42 @@ MCP_REFLECTION_MAX = 50            # 反思记忆最大条数
 MCP_HEARTBEAT_INTERVAL = 30.0      # MCP 心跳间隔（秒）
 
 # ===== Token 计费配置 =====
-# 单位：¥ / 1M tokens（DeepSeek 官方定价 2025）
-# deepseek-chat:      ¥1  input,  ¥2  output
-# deepseek-v4-flash:  ¥1  input,  ¥2  output（采用 deepseek-chat 同价）
-# deepseek-reasoner:  ¥4  input, ¥16  output
+# 单位：¥ / 1M tokens（DeepSeek 官方定价，2026-09）
+#
+# 两个维度影响单价：
+#   ① 时段：高峰价 = 空闲价 × 2
+#      高峰 = 北京时间 周一至周五 9:00-12:00、14:00-18:00；其余为空闲
+#   ② 输入缓存：命中价远低于未命中（鼓励复用稳定前缀）
+#
+# 模型：deepseek-flash / deepseek-v4-pro
+#   旧名 deepseek-v4-flash 已下线，请求由 DeepSeek-V4.1-Flash 提供、按 Flash 价计费
 MODEL_PRICING = {
-    "deepseek-chat":       {"input": 1.0,  "output": 2.0},
-    "deepseek-v4-flash":   {"input": 1.0,  "output": 2.0},
-    "deepseek-reasoner":   {"input": 4.0,  "output": 16.0},
+    "deepseek-flash": {
+        "input_cache_hit":  {"off_peak": 0.02, "peak": 0.04},
+        "input_cache_miss": {"off_peak": 1.0,  "peak": 2.0},
+        "output":           {"off_peak": 4.0,  "peak": 8.0},
+    },
+    "deepseek-v4-pro": {
+        "input_cache_hit":  {"off_peak": 0.15, "peak": 0.30},
+        "input_cache_miss": {"off_peak": 4.5,  "peak": 9.0},
+        "output":           {"off_peak": 13.5, "peak": 27.0},
+    },
+    # 旧模型名：已下线，实际由 V4.1-Flash 提供服务，按 Flash 价计费
+    "deepseek-v4-flash": {
+        "input_cache_hit":  {"off_peak": 0.02, "peak": 0.04},
+        "input_cache_miss": {"off_peak": 1.0,  "peak": 2.0},
+        "output":           {"off_peak": 4.0,  "peak": 8.0},
+    },
 }
-# 未在 MODEL_PRICING 中配置的模型使用此默认定价
-DEFAULT_PRICING = {"input": 1.0, "output": 2.0}
+# 未在 MODEL_PRICING 中配置的模型使用此默认定价（按 Flash 空闲档，偏保守）
+DEFAULT_PRICING = {
+    "input_cache_hit":  {"off_peak": 0.02, "peak": 0.04},
+    "input_cache_miss": {"off_peak": 1.0,  "peak": 2.0},
+    "output":           {"off_peak": 4.0,  "peak": 8.0},
+}
+
+# 高峰时段界定（北京时间，[起, 止) 小时区间；仅周一至周五）
+PEAK_HOURS_WEEKDAY = [(9, 12), (14, 18)]
 
 # 上下文窗口 Token 上限（DeepSeek V4 系列为 128K）
 MAX_CONTEXT_TOKENS = 128000
@@ -145,7 +174,7 @@ CB_COOLDOWN_SECONDS = 30                     # 熔断冷却时间（秒），之
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "")  # 钉钉/飞书机器人 webhook（留空=仅落盘+日志，不发通知）
 
 # ===== 成本控制：模型网关配置（model_gateway.py）=====
-MODEL_ROUTE = {}                              # call_site → 模型名（空=不路由，全用默认模型；如 {"decision_engine.match_skill": "deepseek-chat"}）
+MODEL_ROUTE = {}                              # call_site → 模型名（空=不路由，全用默认模型；如 {"decision_engine.match_skill": "deepseek-flash"}）
 TASK_TOKEN_BUDGET = 0                         # 单任务 Token 预算（0=不限；>0 超预算强制终止返回中间结果）
 
 # ===== 检索结果缓存配置（部署运维改造 P2）=====
@@ -225,7 +254,7 @@ BM25_STOPWORDS_PATH = "./bm25_stopwords.txt"  # 中文停用词表（可选，�
 QUERY_REWRITE_ENABLED = True              # 查询改写总开关
 QUERY_REWRITE_MODE = "clarify"            # clarify（规范化+指代消解）| multi（多查询）| hyde
 QUERY_REWRITE_MULTI_N = 3                 # multi 模式生成的 query 数
-QUERY_REWRITE_MAX_TOKENS = 512            # 改写输出上限（deepseek-v4-flash 是推理模型，需给 reasoning 留足空间，否则 content 为空）
+QUERY_REWRITE_MAX_TOKENS = 512            # 改写输出上限（deepseek-flash 是推理模型，需给 reasoning 留足空间，否则 content 为空）
 QUERY_REWRITE_CACHE_SIZE = 100            # 改写结果 LRU 缓存条数（0=关闭）
 QUERY_REWRITE_COREF_ROUNDS = 3            # 指代消解引用的最近对话轮次
 
@@ -243,7 +272,7 @@ TOOL_AUDIT_SENSITIVE_KEYS = ["api_key", "secret", "token", "password"]  # 掩码
 
 # ===== 独立 Judge 模型配置（终止条件判断）=====
 JUDGE_ENABLED = True                      # 是否启用独立 Judge
-JUDGE_MODEL = os.getenv("JUDGE_MODEL", "deepseek-v4-flash")  # Judge 模型（可用更小模型）
+JUDGE_MODEL = os.getenv("JUDGE_MODEL", "deepseek-flash")  # Judge 模型（可用更小模型）
 JUDGE_MAX_TOKENS = 512                    # 推理模型需要给 reasoning 留足空间
 JUDGE_TEMPERATURE = 0.0                   # 确定性输出
 JUDGE_TIMEOUT = 30                        # Judge 调用超时（秒）
@@ -264,6 +293,9 @@ MEMORY_EXTRACT_ENABLED = True             # 实体抽取开关（False=仅存对
 MEMORY_EXTRACT_MAX_TOKENS = 512           # 抽取 LLM max_tokens（推理模型需给足，否则 content 空）
 MEMORY_DECAY_DAYS = 90                    # 记忆时间衰减：超过此天数显著降权
 MEMORY_DEDUP_SIM = 0.85                   # 抽取去重相似度阈值（>此值视为同一记忆，更新而非新增）
+MEMORY_OVERWRITE_ON_CONFLICT = True       # 改口覆盖：语义命中但内容不同 → 新值优先（False=只加权重保留旧值）
+MEMORY_RERANK_ENABLED = True              # 记忆候选做 Cross-Encoder 重排后再按分过滤（关=纯向量序，行为同改造前）
+MEMORY_MIN_RERANK_SCORE = -5.0            # 重排分下限（BGE logits；-5≈明确不相关。-999=不过滤）
 # 记忆类型权重（注入排序用）：用户画像 > 项目实体 > 历史结论
 MEMORY_TYPE_WEIGHTS = {"profile": 1.0, "entity": 0.7, "conclusion": 0.4}
 

@@ -115,6 +115,20 @@ def get_breaker(destination: str = DESTINATION_MCP_CHANNEL) -> CircuitBreaker:
     return _breakers[destination]
 
 
+def _is_client_error(exc: Exception) -> bool:
+    """判断是否为 4xx 客户端错误（参数不支持 / 鉴权 / 额度不足）。
+
+    这类错误说明「请求本身有问题」，不是下游服务故障，**不应计入熔断**——
+    否则像 DeepSeek 不支持 json_schema 这种必然 400 会污染熔断计数。
+    下游真实故障（超时 / 5xx / 连接错误）仍照常记录。
+    """
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        resp = getattr(exc, "response", None)
+        status = getattr(resp, "status_code", None)
+    return isinstance(status, int) and 400 <= status < 500
+
+
 def call_llm_with_cb(client, model, messages, temperature, max_tokens, call_site, **kwargs):
     """统一 LLM 调用入口（主进程常驻）：熔断 + 成功/失败记录。
 
@@ -152,8 +166,10 @@ def call_llm_with_cb(client, model, messages, temperature, max_tokens, call_site
             temperature=temperature, max_tokens=max_tokens,
             **kwargs,
         )
-    except Exception:
-        breaker.record_failure()
+    except Exception as e:
+        # 4xx 客户端错误不计入熔断（不是下游故障）；超时/5xx/连接错误照记
+        if not _is_client_error(e):
+            breaker.record_failure()
         raise
     breaker.record_success()
     try:

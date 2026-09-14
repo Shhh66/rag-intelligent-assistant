@@ -33,10 +33,15 @@ def _cfg():
 
 
 def _audit_path(path: str) -> str:
-    """相对路径锚定到项目根目录，兼容任意 CWD 启动。"""
+    """相对路径锚定到项目根目录，兼容任意 CWD 启动。
+
+    注意：**不能对 path 取 basename** —— 那会把子目录吞掉
+    （如 RUNTIME_DATA_DIR 产生的 runtime_data/tool_audit.jsonl
+     会被压成 tool_audit.jsonl 落回项目根目录，导致日志分裂成两处）。
+    """
     if os.path.isabs(path):
         return path
-    return os.path.join(_THIS_DIR, os.path.basename(path))
+    return os.path.join(_THIS_DIR, path)
 
 
 def _sanitize_args(args: dict, maxlen: int, sensitive: list) -> dict:

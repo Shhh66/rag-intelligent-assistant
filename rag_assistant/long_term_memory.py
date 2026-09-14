@@ -219,21 +219,26 @@ class LongTermMemory:
 
         1. 按实体 ID（user_id + 归一化内容）精确查
         2. 未命中则语义查近似实体（MEMORY_DEDUP_SIM 阈值）
-        3. 命中任一 → weight += delta（正向强化）+ 刷新时间戳，**不删旧记录**
-        4. 都未命中 → 新增记录，weight = 初始值 1.0
+        3. 精确命中（同一实体）→ weight += delta（正向强化），内容原样保留
+        4. 语义命中但内容不同（用户改口）→ 新值优先：写入新内容 + 继承累积权重，旧记录作废
+        5. 都未命中 → 新增记录，weight = 初始值 1.0
+
+        MEMORY_OVERWRITE_ON_CONFLICT=False 时第 4 类退回「只加权重、内容保留旧值」。
         """
         cfg = _cfg()
         dedup_sim = getattr(cfg, "MEMORY_DEDUP_SIM", 0.85)
+        overwrite = getattr(cfg, "MEMORY_OVERWRITE_ON_CONFLICT", True)
         content = (content or "").strip()
         if not content:
             return
 
         entity_id = self._entity_id(user_id, content)
-        existing = self._get_by_id(entity_id) or self._find_similar(
-            user_id, content, dedup_sim
-        )
+        existing = self._get_by_id(entity_id)
+        exact = existing is not None
+        if not exact:
+            existing = self._find_similar(user_id, content, dedup_sim)
 
-        if existing:
+        if existing and (exact or not overwrite):
             # 权重正向强化：保留累积价值，而非删旧存新
             new_weight = float(existing.get("weight") or 1.0) + delta
             self._upsert(
@@ -245,6 +250,15 @@ class LongTermMemory:
                 weight=new_weight,
             )
             _log(f"权重强化: {content[:30]} → weight={new_weight:.2f}")
+        elif existing:
+            # 用户改口：语义近似但事实已变 → 新值优先，累积权重继承，旧记录作废
+            new_weight = float(existing.get("weight") or 1.0) + delta
+            self._upsert(entity_id, user_id, mem_type, content, confidence,
+                         _now_iso(), weight=new_weight)
+            if existing.get("id") and existing["id"] != entity_id:
+                self._delete(existing["id"])
+            _log(f"记忆覆盖(改口): {str(existing.get('content'))[:24]} → {content[:24]} "
+                 f"weight={new_weight:.2f}")
         else:
             self._upsert(entity_id, user_id, mem_type, content, confidence,
                          _now_iso(), weight=1.0)
@@ -372,7 +386,7 @@ class LongTermMemory:
         return self._parse_json_array(text)
 
     def _llm_summarize(self, user_input, answer):
-        """V0.5：生成一句对话摘要。"""
+        """V0.5：生成一句对话摘要（实体抽取为空时的兜底，会真实产生一次 LLM 调用）。"""
         from config import LLM_MODEL, MEMORY_EXTRACT_MAX_TOKENS
         resp = self._llm_client().chat.completions.create(
             model=LLM_MODEL,
@@ -381,6 +395,12 @@ class LongTermMemory:
             temperature=0,
             max_tokens=MEMORY_EXTRACT_MAX_TOKENS,
         )
+        # 与 _llm_extract 保持一致：记账，否则走兜底路径时成本会漏统计
+        try:
+            from token_tracker import get_tracker
+            get_tracker().record(LLM_MODEL, resp.usage, call_site="memory.summarize")
+        except Exception:
+            pass
         return (resp.choices[0].message.content or "").strip()
 
     @staticmethod
@@ -396,6 +416,30 @@ class LongTermMemory:
             return [d for d in data if isinstance(d, dict) and d.get("content")]
         except Exception:
             return []
+
+    def _rerank_hits(self, query, hits, cfg):
+        """对候选记忆做 Cross-Encoder 重排打分。
+
+        返回与 hits 等长的分数列表（未被重排保留的候选记为 -inf）；
+        未启用 / 候选不足 / 重排失败 一律返回 None —— 调用方跳过过滤，降级为原行为。
+        """
+        if not getattr(cfg, "MEMORY_RERANK_ENABLED", True):
+            return None
+        if len(hits) <= 1:
+            return None
+        try:
+            from reranker import rerank_cross_encoder
+            ranked = rerank_cross_encoder(query, [d for d, _ in hits])
+            kept = {id(d): float((d.metadata or {}).get("rerank_score", float("-inf")))
+                    for d in ranked}
+            if not (kept.keys() & {id(d) for d, _ in hits}):
+                # 重排返回的文档与候选无一对应：强行过滤会误杀全部记忆，故跳过过滤
+                _log("记忆重排结果与候选无法对齐(跳过相关性过滤)")
+                return None
+            return [kept.get(id(d), float("-inf")) for d, _ in hits]
+        except Exception as e:
+            _log(f"记忆重排失败(跳过相关性过滤): {e}")
+            return None
 
     # ── 对外：检索注入 ──────────────────────────────────────
     def retrieve(self, user_id, query, top_k=None):
@@ -418,8 +462,16 @@ class LongTermMemory:
             return []
 
         label = {"profile": "画像", "entity": "项目", "conclusion": "结论"}
+        # 相关性过滤：纯向量分在本嵌入模型上无法区分相关/不相关（实测两组完全重叠，
+        # 见 技术文档/长期记忆.md 对照节），改用 Cross-Encoder 重排分做门槛。
+        min_score = float(getattr(cfg, "MEMORY_MIN_RERANK_SCORE", -5.0))
+        rerank_scores = self._rerank_hits(query, hits, cfg)
         scored = []
-        for doc, dist in hits:
+        filtered = 0
+        for idx, (doc, dist) in enumerate(hits):
+            if rerank_scores is not None and min_score > -999 and rerank_scores[idx] < min_score:
+                filtered += 1
+                continue
             m = doc.metadata or {}
             mtype = m.get("mem_type", "conclusion")
             conf = float(m.get("confidence", 1.0) or 1.0)
@@ -428,6 +480,8 @@ class LongTermMemory:
             rel = 1.0 / (1.0 + max(float(dist), 0.0))   # 距离 → 0~1 相关度
             weight = rel * type_w.get(mtype, 0.4) * conf * decay * mem_weight
             scored.append((weight, mtype, doc.page_content))
+        if filtered:
+            _log(f"相关性过滤 {filtered} 条(阈值 {min_score})")
         scored.sort(key=lambda x: x[0], reverse=True)
 
         out = []

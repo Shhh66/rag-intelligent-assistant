@@ -4,6 +4,16 @@
 Skill 匹配、最终回答三套 Prompt 模板。
 """
 
+import re
+
+# 从「本轮已执行」提示里解析工具/Skill 调用的成败状态。
+# 格式由 unified_agent 生成，是确定性字符串（非 LLM 输出），故可用正则稳定解析：
+#   [本轮已执行] 工具「X」→ 成功: ...
+#   [本轮已执行] Skill「Y」→ 失败: ...
+# 锚定在 `」→ ` 之后，避免工具返回内容里出现"成功/失败"字样时被误判。
+_EXECUTED_STATUS_RE = re.compile(r"\]\s*(?:工具|Skill)「[^」]*」→\s*(成功|失败)")
+
+
 # ── ReAct 决策 Prompt（五阶段） ─────────────────────────────────
 
 # 首轮 Prompt：强制输出规划
@@ -78,7 +88,9 @@ DECISION_PROMPT_TURN_N = """你是一个使用 ReAct 模式推理的智能助手
    - continue：计划未完成，继续执行下一步
    - answer：信息已足够，使用 direct_answer 汇总回答
    - abort：遇到无法解决的问题，强制终止并说明原因
-3. **已执行工具的处理**：如果"工具选择历史"中显示本轮已有工具成功执行并返回结果，你必须使用 direct_answer 汇总这些结果来回答用户，**不要再调用工具**。
+3. **已执行工具的处理**（按"工具选择历史"里的成败状态分别处理）：
+   - **已有工具成功返回结果** → 必须使用 direct_answer 汇总这些结果回答用户，不要重复调用同样的工具
+   - **工具全部失败** → 不要原样重试同一个工具：可换用其他能达成目标的工具重新尝试，确无可用工具时用 direct_answer 如实说明失败原因
 
 ## 工具选择历史（供参考）
 {reflection_hints}
@@ -161,12 +173,30 @@ def build_decision_prompt(
     # 格式化反思提示
     if reflection_hints:
         hints_text = "\n".join(reflection_hints)
-        has_executed = any("本轮已执行" in h for h in reflection_hints)
-        if has_executed:
-            hints_text += (
-                "\n\n⚠️ 上述工具已在本轮执行完毕并返回结果，"
-                "请使用 direct_answer 汇总结果回答用户，不要再调用工具。"
-            )
+        # 已执行工具的结果引导：**按成功/失败分别引导**
+        # 原先只判断「有没有执行过」就给一句"不要再调用工具、直接汇总"，
+        # 结果把「工具失败」也一并推向直接回答 —— 等于掐断了失败后换个工具重试的路径。
+        # 现在：全成功→要求汇总；全失败→允许换工具重规划或降级；部分成功→两者都提示。
+        statuses = _EXECUTED_STATUS_RE.findall(hints_text)
+        if statuses:
+            n_ok, n_fail = statuses.count("成功"), statuses.count("失败")
+            if n_fail == 0:
+                hints_text += (
+                    "\n\n⚠️ 上述工具已执行完毕并**成功**返回结果，"
+                    "请使用 direct_answer 汇总结果回答用户，不要再重复调用同样的工具。"
+                )
+            elif n_ok == 0:
+                hints_text += (
+                    "\n\n⚠️ 上述工具调用**全部失败**（已重试后仍失败），不要原样重试同一个工具。"
+                    "你可以二选一：① 换用其他能达成目标的工具重新尝试；"
+                    "② 若确无可用工具，使用 direct_answer 如实说明失败原因并给出可行的替代建议。"
+                )
+            else:
+                hints_text += (
+                    f"\n\n⚠️ 上述工具中 {n_ok} 个成功、{n_fail} 个失败。"
+                    "已成功的结果可直接使用；**失败的那些不要原样重试**，"
+                    "可换用其他工具补齐，或基于已有结果使用 direct_answer 回答。"
+                )
         # 长期记忆护栏：降低记忆污染导致的幻觉
         if any("长期记忆" in h for h in reflection_hints):
             hints_text += (

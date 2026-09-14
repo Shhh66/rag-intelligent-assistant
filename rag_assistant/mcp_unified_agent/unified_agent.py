@@ -7,7 +7,6 @@
 3. 执行          → Skill 执行器 或 MCP 调度器
 4. 结果回填      → 工具结果注入上下文，回到步骤 2（最多 max_turns 轮）
 5. 最终回答      → LLM 汇总所有工具结果，生成回答
-6. 短期→长期沉淀  → 高频成功的工具沉淀进长期记忆（判据取自审计日志）
 
 运行模型：每次 chat() 使用 asyncio.run() 完成完整的
 MCP 连接 → 流水线 → 断开连接周期，避免跨事件循环问题。
@@ -441,8 +440,10 @@ class UnifiedAgent:
 
             # 2. 长期记忆检索注入（跨会话，按用户隔离）
             # 注：原先还有一路「历史工具选型」提示（内存态反思记忆），实测匹配精度
-            # 不足（字符 bigram 分数分布完全重叠、误召漏召并存），已移除；选型经验
-            # 改由长期记忆承载（沉淀机制见 _maybe_sediment_preference）。
+            # 不足（字符 bigram 分数分布完全重叠、误召漏召并存），已移除。
+            # 长期记忆只存「从单轮问题里读不出来的用户信息」（画像/约束/项目背景），
+            # 不存工具使用习惯——工具由当前问题决定，存了也用不上。详见
+            # 技术文档/长期记忆.md 第十节。
             hints = []
             if HAS_LONG_MEMORY:
                 try:
@@ -557,9 +558,7 @@ class UnifiedAgent:
             )
             all_results.extend(results)
 
-            # 6. 短→长沉淀：某工具高频成功使用则沉淀为长期记忆（判据来自审计日志）
-            self._maybe_sediment_preference()
-
+            # 6. 工具已执行完毕，结果进入下一轮上下文（见上方 all_results 收集）
             # ── 工具结果处理 ──
             success_count = sum(1 for r in results if not r.get("is_error"))
             all_failed = success_count == 0
@@ -861,38 +860,6 @@ class UnifiedAgent:
     def _current_user_id(self) -> str:
         """返回当前用户身份（请求级，由 chat(user_id=...) 设置，不再读文件）。"""
         return self._user_id
-
-    def _maybe_sediment_preference(self) -> None:
-        """短→长沉淀：某工具高频**且占主导**时，沉淀为长期记忆。
-
-        判据读工具审计日志（按 user_id 过滤、跨会话累积），不再依赖内存态
-        反思记忆——后者计数随会话销毁，且拿不到用户维度。无需额外 LLM 调用。
-
-        双条件：成功次数 ≥ MIN_COUNT 且 占比 ≥ MIN_SHARE。
-        只看次数会导致「用过 3 个工具各 3 次」写入 3 条互相矛盾的偏好；
-        占比约束使同时达标的工具至多 2 个（各占比之和 ≤ 1）。
-        重复写入由 record_tool_preference 自身幂等保证，这里不再做会话内去重。
-        """
-        if not HAS_LONG_MEMORY:
-            return
-        try:
-            from tool_audit import count_tool_successes
-            import config as _cfg
-            min_count = self._get_config_int("MEMORY_SEDIMENT_MIN_COUNT", 3)
-            window = self._get_config_int("MEMORY_SEDIMENT_WINDOW", 100)
-            min_share = float(getattr(_cfg, "MEMORY_SEDIMENT_MIN_SHARE", 0.5))
-
-            user_id = self._current_user_id()
-            counts = count_tool_successes(user_id, limit=window)
-            total = sum(counts.values())
-            if not total:
-                return
-            for tool, n in counts.items():
-                if n < min_count or (n / total) < min_share:
-                    continue
-                get_memory().record_tool_preference(user_id, tool)
-        except Exception:
-            pass
 
     def clear_memory(self) -> None:
         """清空对话记忆（会话历史 + 会话摘要）。"""

@@ -72,8 +72,8 @@ def log_tool_call(
 ) -> None:
     """记录一次工具调用审计（失败静默，不阻断主链路）。
 
-    user_id：请求级用户身份（可选）。带上后才支持「按用户」聚合，
-    供短期高频 → 长期记忆的沉淀判定使用（见 count_tool_successes）。
+    user_id：请求级用户身份（可选）。用于审计归属——记录「谁发起的这次调用」，
+    否则审计日志无法按用户复盘（原先只有 trace_id，追溯不到人）。
     """
     enabled, path, maxlen, sensitive = _cfg()
     if not enabled:
@@ -143,57 +143,6 @@ def log_decision(
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception as e:
         logger.warning(f"决策审计写入失败(忽略): {e}")
-
-
-def _read_tail_records(path: str, limit: int, max_bytes: int = 256 * 1024) -> list[dict]:
-    """只读文件尾部 max_bytes 再解析出最后 limit 条记录（坏行跳过）。
-
-    审计日志是只增不减的，全量扫描会随运行时间线性变慢，故只读尾部。
-    从中间截断产生的半行 JSON 解析失败会被跳过，不影响结果。
-    """
-    out: list[dict] = []
-    try:
-        with open(path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            f.seek(max(0, size - max_bytes))
-            chunk = f.read().decode("utf-8", errors="ignore")
-    except Exception:
-        return out
-    for line in chunk.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            out.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return out[-limit:]
-
-
-def count_tool_successes(user_id: str, limit: int = 100) -> dict:
-    """统计某用户最近 limit 次工具调用中的成功次数（按工具名聚合）。
-
-    供「短期高频 → 长期沉淀」做频次判定：原先依赖内存态反思记忆（随会话销毁、
-    且拿不到用户维度），改读本模块自己的审计日志后，可跨会话累积且按用户隔离。
-    失败返回 {}，绝不阻断主链路。
-    """
-    enabled, path, _maxlen, _sensitive = _cfg()
-    if not enabled or not user_id:
-        return {}
-    counts: dict[str, int] = {}
-    try:
-        for rec in _read_tail_records(_audit_path(path), limit):
-            if "tool_name" not in rec:          # 跳过 decision 记录
-                continue
-            if rec.get("user_id") != user_id:
-                continue
-            if rec.get("success"):
-                name = rec.get("tool_name")
-                counts[name] = counts.get(name, 0) + 1
-    except Exception:
-        return {}
-    return counts
 
 
 # ── 自测 ──

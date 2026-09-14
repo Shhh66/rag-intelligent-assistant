@@ -7,7 +7,10 @@
 能力：
 - extract_and_store：每轮对话后抽取记忆（V0.5=摘要 / V1.0=LLM实体抽取），去重更新
 - retrieve：按 user_id 过滤 + query 语义检索 + 权重排序（语义×时间衰减×类型权重×置信度）
-- 短→长沉淀：高频工具偏好自动沉淀（由 unified_agent 调 record_tool_preference）
+
+**存什么、不存什么**：只存「从单轮问题里读不出来的用户信息」（画像 / 固定约束 / 项目背景 /
+已确认结论）。**不存工具使用习惯**——工具由当前问题决定，历史习惯对当前决策无用，
+且会占用有限的注入槽位。详见 技术文档/长期记忆.md 第十节。
 
 全程降级安全：任何失败静默跳过，绝不阻断主对话。按 user_id 隔离防串户。
 """
@@ -507,23 +510,6 @@ class LongTermMemory:
             return max(0.3, 1.0 - (age_days - decay_days) / (decay_days * 2))
         except Exception:
             return 1.0
-
-    # ── 短→长沉淀：高频工具偏好 ────────────────────────────
-    def record_tool_preference(self, user_id, tool_name):
-        """连续高频使用某工具时沉淀为用户偏好（由 unified_agent 判定触发）。
-
-        幂等：同一条偏好只写一次。判据是「记忆库中是否已存在」，而非调用方记没记过——
-        原先靠调用侧的内存去重集合，跨会话就失效，导致每个新会话重复写入，
-        把 weight 一次次 +1（weight 代表累积证据，不代表"被推导过几次"）。
-        """
-        if not self._ensure():
-            return
-        user_id = user_id or "default"
-        content = f"用户偏好优先使用工具「{tool_name}」"
-        if self._get_by_id(self._entity_id(user_id, content)):
-            return
-        self._store_one(user_id, "profile", content, 0.7)
-        _log(f"沉淀工具偏好: {tool_name}(user={user_id})")
 
     # ── 管理 ────────────────────────────────────────────────
     def clear(self, user_id):

@@ -295,10 +295,6 @@ MEMORY_DEDUP_SIM = 0.85                   # 抽取去重相似度阈值（>此�
 MEMORY_OVERWRITE_ON_CONFLICT = True       # 改口覆盖：语义命中但内容不同 → 新值优先（False=只加权重保留旧值）
 MEMORY_RERANK_ENABLED = True              # 记忆候选做 Cross-Encoder 重排后再按分过滤（关=纯向量序，行为同改造前）
 MEMORY_MIN_RERANK_SCORE = -5.0            # 重排分下限（BGE logits；-5≈明确不相关。-999=不过滤）
-# 短→长沉淀判据（读审计日志，计数 + 占比双条件）
-MEMORY_SEDIMENT_WINDOW = 100              # 回看该用户最近多少次工具调用
-MEMORY_SEDIMENT_MIN_COUNT = 3             # 最少成功次数（样本太少的"高频"无意义）
-MEMORY_SEDIMENT_MIN_SHARE = 0.5           # 占该用户成功调用的最低比例（占比之和 ≤ 1，故至多 2 个工具同时达标）
 # 记忆类型权重（注入排序用）：用户画像 > 项目实体 > 历史结论
 MEMORY_TYPE_WEIGHTS = {"profile": 1.0, "entity": 0.7, "conclusion": 0.4}
 

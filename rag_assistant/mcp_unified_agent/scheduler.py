@@ -39,6 +39,7 @@ class Scheduler:
         trace_id: str = "",
         kb_groups: list = None,
         permissions: list = None,
+        user_id: str = "",
     ):
         self.mcp_client = mcp_client
         self.registry = registry
@@ -46,6 +47,7 @@ class Scheduler:
         self.trace_id = trace_id
         self.kb_groups = kb_groups  # 请求级权限分组（None=不限权限，不注入）
         self.permissions = permissions  # 请求级工具权限（None=不限，不校验）
+        self.user_id = user_id  # 请求级用户身份（写入审计，供按用户聚合）
         try:
             from config import TOOL_PERMISSION_ENABLED
             self.tool_perm_enabled = TOOL_PERMISSION_ENABLED
@@ -238,6 +240,7 @@ class Scheduler:
                 latency_ms=latency_ms,
                 success=success,
                 error=error,
+                user_id=self.user_id,
             )
         except Exception:
             pass

@@ -13,6 +13,7 @@
 """
 
 import logging
+import os
 from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
@@ -46,8 +47,21 @@ def _get_client():
     return _client
 
 
+def _env_trace_id() -> str:
+    """子进程兜底：主进程通过 MCP_TRACE_ID 环境变量把 trace_id 带进 MCP 子进程。
+
+    MCP 子进程是 per-request 新建的，检索链路（retriever）跑在子进程内，
+    它拿不到主进程的 trace_id —— 不兜底的话子进程 span 会各自变成独立 trace。
+    """
+    try:
+        return os.getenv("MCP_TRACE_ID", "") or ""
+    except Exception:
+        return ""
+
+
 def _trace_ctx(trace_id):
     """把我们的 trace_id 转成 LangFuse trace_context。"""
+    trace_id = trace_id or _env_trace_id()
     if not trace_id:
         return None
     try:

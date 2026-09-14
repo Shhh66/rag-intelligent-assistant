@@ -41,6 +41,7 @@ class SkillExecutor:
         trace_id: str = "",
         registry=None,
         permissions: list = None,
+        user_id: str = "",
     ):
         self.mcp = mcp_session
         self.step_timeout = step_timeout
@@ -49,6 +50,7 @@ class SkillExecutor:
         self.trace_id = trace_id
         self.registry = registry  # ToolRegistry，用于工具鉴权查 required_perms
         self.permissions = permissions  # 请求级工具权限（None=不限，不校验）
+        self.user_id = user_id  # 请求级用户身份（写入审计，供按用户聚合）
         self._logs: list[dict] = []
 
     # ── 主入口 ────────────────────────────────────────────────
@@ -409,6 +411,7 @@ class SkillExecutor:
                 success=success,
                 retry_count=max(0, attempt),
                 error=error,
+                user_id=self.user_id,
             )
         except Exception:
             pass

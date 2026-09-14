@@ -7,7 +7,7 @@
 3. 执行          → Skill 执行器 或 MCP 调度器
 4. 结果回填      → 工具结果注入上下文，回到步骤 2（最多 max_turns 轮）
 5. 最终回答      → LLM 汇总所有工具结果，生成回答
-6. 反思记忆      → 记录工具选择，供未来参考
+6. 短期→长期沉淀  → 高频成功的工具沉淀进长期记忆（判据取自审计日志）
 
 运行模型：每次 chat() 使用 asyncio.run() 完成完整的
 MCP 连接 → 流水线 → 断开连接周期，避免跨事件循环问题。
@@ -48,12 +48,6 @@ except ImportError:
     HAS_VECTOR_FILTER = False
 
 try:
-    from .reflection_memory import ReflectionMemory, ReflectionEntry
-    HAS_REFLECTION = True
-except ImportError:
-    HAS_REFLECTION = False
-
-try:
     import sys as _sys, os as _os
     _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
     from long_term_memory import get_memory
@@ -74,7 +68,7 @@ class UnifiedAgent:
     """MCP 统一智能体。
 
     每次 chat() 调用完成完整的 MCP 连接 → 流水线 → 断开周期。
-    对话历史和反思记忆在多次调用间持久保留。
+    对话历史与会话摘要在多次调用间持久保留。
     """
 
     def __init__(self, config: dict | None = None):
@@ -98,7 +92,6 @@ class UnifiedAgent:
         # 持久状态（跨 chat() 调用保留）
         self._history: list[dict] = []       # 对话历史
         self._session_summary: str = ""      # 会话摘要（压缩早期对话，注入 system）
-        self._reflection: ReflectionMemory | None = None  # 反思记忆
         self._skill_registry: SkillRegistry | None = None  # Skill 注册表
         self._user_id: str = "default"       # 当前用户身份（长期记忆隔离，请求级，不再读文件）
 
@@ -196,9 +189,18 @@ class UnifiedAgent:
         trace_id = uuid.uuid4().hex
         get_tracker().set_trace_id(trace_id)
 
+        # 把 trace_id 经环境变量带进 MCP 子进程，使子进程内检索链路的 span
+        # 也能并入同一条 trace（子进程 per-request 新建，拿不到主进程状态）。
+        # 取不到默认环境就不注入（env=None），行为与改造前完全一致。
+        try:
+            from mcp.client.stdio import get_default_environment
+            child_env = {**get_default_environment(), "MCP_TRACE_ID": trace_id}
+        except Exception:
+            child_env = None
         params = StdioServerParameters(
             command=self.server_command,
             args=self.server_args,
+            env=child_env,
         )
         logger.info(f"MCP 启动: {self.server_command} {' '.join(self.server_args)}")
 
@@ -235,7 +237,8 @@ class UnifiedAgent:
                 decision_engine.session_summary = self._session_summary
                 scheduler = Scheduler(mcp, tool_registry, self.call_timeout,
                                       trace_id=trace_id, kb_groups=kb_groups,
-                                      permissions=permissions)
+                                      permissions=permissions,
+                                      user_id=self._current_user_id())
 
                 answer = await self._pipeline(
                     user_input=user_input,
@@ -292,11 +295,6 @@ class UnifiedAgent:
                 self._skill_registry = SkillRegistry()
                 skill_count = self._skill_registry.load_all()
                 logger.info(f"Skill 注册表初始化完成: {skill_count} 个 Skill")
-
-            # 初始化反思记忆
-            if HAS_REFLECTION and self._reflection is None:
-                max_entries = self._get_config_int("MCP_REFLECTION_MAX", 50)
-                self._reflection = ReflectionMemory(max_entries=max_entries)
 
         except Exception as e:
             logger.error(f"预热失败: {e}")
@@ -388,6 +386,7 @@ class UnifiedAgent:
                                 trace_id=scheduler.trace_id,
                                 registry=tool_registry,
                                 permissions=scheduler.permissions,
+                                user_id=scheduler.user_id,
                             )
                             answer = await executor.execute(
                                 skill, skill_result.args
@@ -440,15 +439,14 @@ class UnifiedAgent:
             else:
                 candidate_tools = tool_registry.get_all()
 
-            # 2. 获取反思提示（含前序工具调用结果）
+            # 2. 长期记忆检索注入（跨会话，按用户隔离）
+            # 注：原先还有一路「历史工具选型」提示（内存态反思记忆），实测匹配精度
+            # 不足（字符 bigram 分数分布完全重叠、误召漏召并存），已移除；选型经验
+            # 改由长期记忆承载（沉淀机制见 _maybe_sediment_preference）。
             hints = []
-            if self._reflection:
-                hints = self._reflection.get_relevant_hints(user_input)
-            # 2b. 长期记忆检索注入（跨会话，按用户隔离；与 reflection hints 并列）
             if HAS_LONG_MEMORY:
                 try:
-                    mem_hints = get_memory().retrieve(self._current_user_id(), user_input)
-                    hints = list(mem_hints) + list(hints)  # 长期记忆置前
+                    hints = list(get_memory().retrieve(self._current_user_id(), user_input))
                 except Exception:
                     pass
             # 将前序轮次的工具结果注入提示，避免 LLM 不知情重复调用
@@ -501,6 +499,7 @@ class UnifiedAgent:
                     plan=decision.plan,
                     evaluation=decision.evaluation,
                     decision=decision.decision,
+                    user_id=scheduler.user_id,
                 )
             except Exception:
                 pass
@@ -539,7 +538,8 @@ class UnifiedAgent:
                 if skill:
                     try:
                         executor = SkillExecutor(mcp_session, step_timeout=self.call_timeout, trace_id=scheduler.trace_id,
-                                                 registry=tool_registry, permissions=scheduler.permissions)
+                                                 registry=tool_registry, permissions=scheduler.permissions,
+                                                 user_id=scheduler.user_id)
                         answer = await executor.execute(skill, decision.skill_args)
                         self._record_conversation(user_input, answer)
                         return answer
@@ -557,19 +557,8 @@ class UnifiedAgent:
             )
             all_results.extend(results)
 
-            # 6. 记录反思
-            if self._reflection:
-                for i, tool_dec in enumerate(decision.tools):
-                    r = results[i] if i < len(results) else {}
-                    self._reflection.record(ReflectionEntry(
-                        query=user_input,
-                        selected_tool=tool_dec.tool_name,
-                        success=not r.get("is_error", True),
-                        result_preview=str(r.get("result", ""))[:200],
-                        latency_ms=r.get("latency_ms", 0),
-                    ))
-                # 6b. 短→长沉淀：某工具高频使用则沉淀为用户偏好（无需额外 LLM）
-                self._maybe_sediment_preference()
+            # 6. 短→长沉淀：某工具高频成功使用则沉淀为长期记忆（判据来自审计日志）
+            self._maybe_sediment_preference()
 
             # ── 工具结果处理 ──
             success_count = sum(1 for r in results if not r.get("is_error"))
@@ -619,6 +608,7 @@ class UnifiedAgent:
                             plan=current_plan,
                             evaluation=judge_result.raw_output,
                             decision=judge_result.decision.lower(),
+                            user_id=scheduler.user_id,
                         )
                     except Exception:
                         pass
@@ -872,36 +862,43 @@ class UnifiedAgent:
         """返回当前用户身份（请求级，由 chat(user_id=...) 设置，不再读文件）。"""
         return self._user_id
 
-    def _maybe_sediment_preference(self, threshold: int = 3) -> None:
-        """短→长沉淀：某工具在反思记忆里成功使用达到阈值 → 沉淀为用户偏好。
+    def _maybe_sediment_preference(self) -> None:
+        """短→长沉淀：某工具高频**且占主导**时，沉淀为长期记忆。
 
-        复用 ReflectionMemory 已记录的 selected_tool，无需额外 LLM 调用。
-        每个工具每进程只沉淀一次（_sedimented 去重）。
+        判据读工具审计日志（按 user_id 过滤、跨会话累积），不再依赖内存态
+        反思记忆——后者计数随会话销毁，且拿不到用户维度。无需额外 LLM 调用。
+
+        双条件：成功次数 ≥ MIN_COUNT 且 占比 ≥ MIN_SHARE。
+        只看次数会导致「用过 3 个工具各 3 次」写入 3 条互相矛盾的偏好；
+        占比约束使同时达标的工具至多 2 个（各占比之和 ≤ 1）。
+        重复写入由 record_tool_preference 自身幂等保证，这里不再做会话内去重。
         """
-        if not (HAS_LONG_MEMORY and self._reflection):
+        if not HAS_LONG_MEMORY:
             return
         try:
-            if not hasattr(self, "_sedimented"):
-                self._sedimented = set()
-            counts = {}
-            for e in list(self._reflection._entries):
-                if e.success:
-                    counts[e.selected_tool] = counts.get(e.selected_tool, 0) + 1
+            from tool_audit import count_tool_successes
+            import config as _cfg
+            min_count = self._get_config_int("MEMORY_SEDIMENT_MIN_COUNT", 3)
+            window = self._get_config_int("MEMORY_SEDIMENT_WINDOW", 100)
+            min_share = float(getattr(_cfg, "MEMORY_SEDIMENT_MIN_SHARE", 0.5))
+
+            user_id = self._current_user_id()
+            counts = count_tool_successes(user_id, limit=window)
+            total = sum(counts.values())
+            if not total:
+                return
             for tool, n in counts.items():
-                if n >= threshold and tool not in self._sedimented:
-                    self._sedimented.add(tool)
-                    get_memory().record_tool_preference(self._current_user_id(), tool)
-                    logger.info(f"沉淀用户偏好: 高频工具「{tool}」({n}次)")
+                if n < min_count or (n / total) < min_share:
+                    continue
+                get_memory().record_tool_preference(user_id, tool)
         except Exception:
             pass
 
     def clear_memory(self) -> None:
-        """清空对话记忆和反思记忆。"""
+        """清空对话记忆（会话历史 + 会话摘要）。"""
         self._history.clear()
         self._session_summary = ""   # 会话摘要随对话历史一起清空
-        if self._reflection:
-            self._reflection.clear()
-        logger.info("对话记忆和反思记忆已清空")
+        logger.info("对话记忆已清空")
 
     @property
     def memory(self):

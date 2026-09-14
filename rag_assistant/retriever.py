@@ -5,6 +5,17 @@ from openai import OpenAI
 from config import GROQ_API_KEY, GROQ_BASE_URL, LLM_MODEL, TOP_K, HYBRID_ENABLED, SEARCH_CACHE_ENABLED
 from vector_store import search
 from token_tracker import get_tracker
+from observability import obs_span
+
+
+def _obs_update(span, **kw):
+    """给已创建的 LangFuse span 补充 output/metadata/level。span 为 None 时静默跳过。"""
+    if span is None:
+        return
+    try:
+        span.update(**kw)
+    except Exception:
+        pass
 
 
 def _search(query: str, top_k: int = TOP_K, kb_groups: list = None):
@@ -123,9 +134,12 @@ def answer_with_fallback(query: str, top_k: int = TOP_K, history: list = None,
         search_query = query
         try:
             from query_rewriter import rewrite_query
-            rewritten = rewrite_query(query, history=history, mode="clarify")
-            if isinstance(rewritten, str) and rewritten.strip():
-                search_query = rewritten
+            with obs_span("查询改写", metadata={"mode": "clarify"}, input=query) as _sp:
+                rewritten = rewrite_query(query, history=history, mode="clarify")
+                if isinstance(rewritten, str) and rewritten.strip():
+                    search_query = rewritten
+                _obs_update(_sp, output=search_query,
+                            metadata={"rewritten": search_query != query})
         except Exception as e:
             print(f"   ⚠️ 查询改写跳过: {e}", file=sys.stderr)
 
@@ -134,23 +148,29 @@ def answer_with_fallback(query: str, top_k: int = TOP_K, history: list = None,
         docs_cn, docs_en = [], []
         db_error = False
 
-        try:
-            print(f"   🔍 中文检索: {search_query[:40]}...", file=sys.stderr)
-            docs_cn = _search(search_query, top_k=top_k, kb_groups=kb_groups)
-            print(f"      找到 {len(docs_cn)} 个片段", file=sys.stderr)
-        except Exception as e:
-            db_error = True
-            print(f"   ⚠️ 检索失败: {e}", file=sys.stderr)
-
-        if not db_error:
+        with obs_span("混合检索", metadata={"hybrid_enabled": HYBRID_ENABLED},
+                      input=search_query) as _sp:
             try:
-                en_query = _translate_query_for_search(search_query)
-                if en_query and en_query.strip():
-                    print(f"   🔍 英文检索: {en_query}", file=sys.stderr)
-                    docs_en = _search(en_query, top_k=top_k, kb_groups=kb_groups)
-                    print(f"      找到 {len(docs_en)} 个片段", file=sys.stderr)
+                print(f"   🔍 中文检索: {search_query[:40]}...", file=sys.stderr)
+                docs_cn = _search(search_query, top_k=top_k, kb_groups=kb_groups)
+                print(f"      找到 {len(docs_cn)} 个片段", file=sys.stderr)
             except Exception as e:
-                print(f"   ⚠️ 英文检索失败: {e}", file=sys.stderr)
+                db_error = True
+                print(f"   ⚠️ 检索失败: {e}", file=sys.stderr)
+
+            if not db_error:
+                try:
+                    en_query = _translate_query_for_search(search_query)
+                    if en_query and en_query.strip():
+                        print(f"   🔍 英文检索: {en_query}", file=sys.stderr)
+                        docs_en = _search(en_query, top_k=top_k, kb_groups=kb_groups)
+                        print(f"      找到 {len(docs_en)} 个片段", file=sys.stderr)
+                except Exception as e:
+                    print(f"   ⚠️ 英文检索失败: {e}", file=sys.stderr)
+
+            _obs_update(_sp, level="ERROR" if db_error else "DEFAULT",
+                        metadata={"cn_docs": len(docs_cn), "en_docs": len(docs_en),
+                                  "db_error": db_error})
 
         # 2. 无知识库或检索失败 → LLM 直接回答
         if db_error or (not docs_cn and not docs_en):
@@ -181,7 +201,9 @@ def answer_with_fallback(query: str, top_k: int = TOP_K, history: list = None,
 
     # 3.5 重排：精排候选片段，提升相关性
     from reranker import rerank
-    merged = rerank(query, merged)
+    with obs_span("重排", metadata={"candidates": len(merged)}, input=query) as _sp:
+        merged = rerank(query, merged)
+        _obs_update(_sp, output=f"精排后保留 {len(merged)} 条")
 
     # 4. 构建 Prompt 并调用 LLM
     prompt = build_prompt(query, merged)

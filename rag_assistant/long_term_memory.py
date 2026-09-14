@@ -510,11 +510,20 @@ class LongTermMemory:
 
     # ── 短→长沉淀：高频工具偏好 ────────────────────────────
     def record_tool_preference(self, user_id, tool_name):
-        """连续高频使用某工具时沉淀为用户偏好（由 unified_agent 判定触发）。"""
+        """连续高频使用某工具时沉淀为用户偏好（由 unified_agent 判定触发）。
+
+        幂等：同一条偏好只写一次。判据是「记忆库中是否已存在」，而非调用方记没记过——
+        原先靠调用侧的内存去重集合，跨会话就失效，导致每个新会话重复写入，
+        把 weight 一次次 +1（weight 代表累积证据，不代表"被推导过几次"）。
+        """
         if not self._ensure():
             return
-        self._store_one(user_id or "default", "profile",
-                        f"用户偏好优先使用工具「{tool_name}」", 0.7)
+        user_id = user_id or "default"
+        content = f"用户偏好优先使用工具「{tool_name}」"
+        if self._get_by_id(self._entity_id(user_id, content)):
+            return
+        self._store_one(user_id, "profile", content, 0.7)
+        _log(f"沉淀工具偏好: {tool_name}(user={user_id})")
 
     # ── 管理 ────────────────────────────────────────────────
     def clear(self, user_id):

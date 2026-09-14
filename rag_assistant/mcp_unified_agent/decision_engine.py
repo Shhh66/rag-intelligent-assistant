@@ -2,7 +2,7 @@
 
 构建 Prompt → 调用 LLM → 解析结构化 JSON 决策。
 
-负责将工具元数据、对话历史、反思记忆注入 Prompt，
+负责将工具元数据、对话历史、长期记忆上下文注入 Prompt，
 然后解析 LLM 返回的 JSON 决策为 AgentDecision 对象。
 
 输出约束：采用 Structured Outputs（response_format=json_schema），
@@ -204,7 +204,7 @@ class SkillMatchResult:
 class DecisionEngine:
     """决策引擎：构建 Prompt → 调用 LLM → 解析结构化 JSON 决策。
 
-    负责注入工具元数据、对话历史、反思记忆到 Prompt，
+    负责注入工具元数据、对话历史、长期记忆上下文到 Prompt，
     然后解析 LLM 返回的 JSON 决策为 AgentDecision 对象。
     """
 

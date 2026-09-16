@@ -37,8 +37,8 @@ services:
       - "3000:3000"
     environment:
       DATABASE_URL: postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
-      NEXTAUTH_SECRET: change-me-to-a-random-secret
-      SALT: change-me-to-a-random-salt
+      NEXTAUTH_SECRET: "YWofIjcsXBzWOXVBWWmQoooMnaR1mSLoYZQbuexosEU="
+      SALT: "l6wLLIQ77heebYbBrLl+gVsAR1pDbHb0nkC62M3BRlU="
       NEXTAUTH_URL: http://localhost:3000
       TELEMETRY_ENABLED: "false"
       # 个人本地使用，允许直接注册

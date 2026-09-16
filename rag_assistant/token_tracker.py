@@ -149,6 +149,7 @@ class TokenTracker:
         model: str,
         usage,
         call_site: str = "",
+        latency_ms: float = None,
     ) -> TokenUsage:
         """记录一次 LLM 调用。
 
@@ -156,6 +157,7 @@ class TokenTracker:
             model: 模型名称
             usage: OpenAI SDK 返回的 response.usage
             call_site: 调用位置标识
+            latency_ms: 本次 LLM 调用耗时（毫秒），仅用于 LangFuse generation 的耗时展示
 
         Returns:
             TokenUsage: 本次调用的用量记录
@@ -204,6 +206,7 @@ class TokenTracker:
                 model=model,
                 usage=usage,
                 metadata={"call_site": call_site, "cost_rmb": cost},
+                latency_ms=latency_ms,
             )
         except Exception:
             pass

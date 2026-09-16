@@ -1,7 +1,7 @@
 streamlit>=1.57
 openai>=2.38
 httpx>=0.28
-mcp>=1.28
+mcp>=1.28,<2
 chromadb>=1.5
 langchain-core>=1.4
 langchain-chroma>=1.1
@@ -10,6 +10,11 @@ sentence-transformers>=5.5
 python-docx>=1.1
 pypdf>=6.12
 jsonschema>=4.26
+# ===== 文档解析：PaddleOCR（扫描件/公式识别的降级通道，进程内懒加载）=====
+# paddlepaddle 的 protobuf 上界(<=3.20.2)只在 Windows 生效，Linux/容器只需 >=3.20.2，
+# 故容器内无需回退 protobuf。本地 Windows venv 仍需手动回退（见文件末尾说明）。
+paddlepaddle==2.6.2
+paddleocr>=2.9,<3
 numpy>=2.4
 python-dotenv>=1.0
 tiktoken>=0.7
@@ -24,7 +29,8 @@ rank_bm25>=0.2
 jieba>=0.42
 # ===== MCP 工程化 + 可观测性 =====
 tenacity>=8            # 工具调用统一重试+指数退避
-langfuse>=4            # 全链路可观测(自托管)
+langfuse>=2.60,<3      # 全链路可观测(自托管)。必须锁 2.x：服务端是 OSS v2，
+                       # 只支持 SDK v1/v2；SDK 3.x/4.x 改用 OTel 上报，打 v2 服务端会 404 全丢
 # 注意：langfuse 会拉高 protobuf，但 paddlepaddle 2.6.2 要求 protobuf<=3.20.2，
 # 安装后须 `pip install "protobuf<=3.20.2"` 回退，二者共存(langfuse 走 HTTP，不受影响)
 

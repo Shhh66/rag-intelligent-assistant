@@ -15,6 +15,7 @@
 import logging
 import os
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -59,16 +60,17 @@ def _env_trace_id() -> str:
         return ""
 
 
-def _trace_ctx(trace_id):
-    """把我们的 trace_id 转成 LangFuse trace_context。"""
-    trace_id = trace_id or _env_trace_id()
-    if not trace_id:
-        return None
-    try:
-        # LangFuse 要求 trace_id 为 32 位小写 hex，uuid4().hex 正好满足
-        return {"trace_id": trace_id}
-    except Exception:
-        return None
+def _get_trace(client, trace_id):
+    """按 trace_id 取/建 trace。
+
+    LangFuse v2 SDK 用 client.trace(id=...) 引用 trace，同 id 幂等（服务端 upsert），
+    所以每个 span/generation 各自取一次是安全的，不会产生重复 trace。
+    trace_id 为 32 位小写 hex（uuid4().hex），符合服务端要求。
+    """
+    tid = trace_id or _env_trace_id()
+    if tid:
+        return client.trace(id=tid)
+    return client.trace()
 
 
 @contextmanager
@@ -80,10 +82,8 @@ def obs_span(name, trace_id="", metadata=None, level="DEFAULT", input=None):
         return
     span = None
     try:
-        span = client.start_observation(
+        span = _get_trace(client, trace_id).span(
             name=name,
-            as_type="span",
-            trace_context=_trace_ctx(trace_id),
             metadata=metadata or {},
             level=level,
             input=input,
@@ -102,28 +102,40 @@ def obs_span(name, trace_id="", metadata=None, level="DEFAULT", input=None):
 
 
 def obs_generation(trace_id="", name="llm", model=None, usage=None,
-                   input=None, output=None, metadata=None):
-    """记录一次 LLM generation（含 token usage），供成本归因。no-op 安全。"""
+                   input=None, output=None, metadata=None, latency_ms=None):
+    """记录一次 LLM generation（含 token usage 与耗时），供成本归因。no-op 安全。
+
+    注意（langfuse 2.x 专有）：token 必须走 usage= 参数。实测 SDK 2.60.10 上
+    usage_details= 会被服务端存成全 0，只有 usage= 能正确落库（unit 需 "TOKENS"）。
+    """
     client = _get_client()
     if client is None:
         return
     try:
-        usage_details = None
+        usage_payload = None
         if usage is not None:
-            usage_details = {
+            raw = {
                 "input": getattr(usage, "prompt_tokens", None),
                 "output": getattr(usage, "completion_tokens", None),
                 "total": getattr(usage, "total_tokens", None),
             }
-        gen = client.start_observation(
+            raw = {k: v for k, v in raw.items() if v is not None}
+            if raw:
+                raw["unit"] = "TOKENS"
+                usage_payload = raw
+
+        end_t = datetime.now(timezone.utc)
+        start_t = end_t - timedelta(milliseconds=latency_ms) if latency_ms else end_t
+
+        gen = _get_trace(client, trace_id).generation(
             name=name,
-            as_type="generation",
-            trace_context=_trace_ctx(trace_id),
             model=model,
-            usage_details=usage_details,
+            usage=usage_payload,
             input=input,
             output=output,
             metadata=metadata or {},
+            start_time=start_t,
+            end_time=end_t,
         )
         gen.end()
     except Exception as e:

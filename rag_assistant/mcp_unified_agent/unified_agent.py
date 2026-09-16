@@ -15,6 +15,7 @@ MCP 连接 → 流水线 → 断开连接周期，避免跨事件循环问题。
 import asyncio
 import json
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -193,7 +194,12 @@ class UnifiedAgent:
         # 取不到默认环境就不注入（env=None），行为与改造前完全一致。
         try:
             from mcp.client.stdio import get_default_environment
-            child_env = {**get_default_environment(), "MCP_TRACE_ID": trace_id}
+            # ⚠️ 必须并入 os.environ：get_default_environment() 只返回 PATH/HOME 等
+            #    系统级白名单变量，容器里注入的 REDIS_HOST / LANGFUSE_HOST 等业务变量
+            #    不会被子进程继承，子进程会回落到 config 的 localhost 默认值
+            #    （表现为子进程内 Redis 连不上、LangFuse 上报失败）。
+            #    本地开发看不出来，因为本地默认值恰好就是 localhost。
+            child_env = {**get_default_environment(), **os.environ, "MCP_TRACE_ID": trace_id}
         except Exception:
             child_env = None
         params = StdioServerParameters(

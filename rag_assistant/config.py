@@ -24,7 +24,7 @@ def runtime_path(filename: str, default: str) -> str:
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
 
-GROQ_BASE_URL = "https://api.deepseek.com"
+GROQ_BASE_URL = "https://api.deepseek.com/beta"
 
 # LLM 模型名称
 LLM_MODEL = "deepseek-flash"
@@ -277,7 +277,7 @@ JUDGE_TEMPERATURE = 0.0                   # 确定性输出
 JUDGE_TIMEOUT = 30                        # Judge 调用超时（秒）
 
 # ===== 可观测性（LangFuse 自托管）=====
-LANGFUSE_ENABLED = False                  # 总开关（默认关，需先起 LangFuse 服务再开）
+LANGFUSE_ENABLED = True                   # 总开关（默认关，需先起 LangFuse 服务再开）
 # 密钥走 .env：LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_HOST
 LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY", "")
 LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY", "")

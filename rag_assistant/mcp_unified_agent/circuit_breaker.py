@@ -160,6 +160,8 @@ def call_llm_with_cb(client, model, messages, temperature, max_tokens, call_site
         raise
     except Exception:
         pass  # 限流组件异常不影响主链路（rate_limiter 内部已 fail-open 兜底）
+    import time
+    _t0 = time.monotonic()
     try:
         resp = client.chat.completions.create(
             model=model, messages=messages,
@@ -174,7 +176,8 @@ def call_llm_with_cb(client, model, messages, temperature, max_tokens, call_site
     breaker.record_success()
     try:
         from token_tracker import get_tracker
-        get_tracker().record(model, resp.usage, call_site=call_site)
+        get_tracker().record(model, resp.usage, call_site=call_site,
+                             latency_ms=(time.monotonic() - _t0) * 1000)
     except Exception:
         pass
     return resp

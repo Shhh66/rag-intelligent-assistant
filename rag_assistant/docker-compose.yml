@@ -47,6 +47,10 @@ services:
       RUNTIME_DATA_DIR: /app/runtime_data
     volumes:
       - ./runtime_data:/app/runtime_data     # 权限数据库（用户/角色/分组）落此目录
+      # ⚠️ 必须挂载：/api/kb/documents 等接口要读 ChromaDB 与 db_meta.json。
+      #    不挂则 api-server 读的是镜像内的空库 → 管理后台文档列表永远显示 0。
+      - ./chroma_db:/app/chroma_db
+      - ./uploaded_docs:/app/uploaded_docs   # 删除文档时同步清理原始文件
       - ./.env:/app/.env
     depends_on:
       redis:
@@ -98,6 +102,10 @@ services:
       EMBED_SERVER_URL: http://embed-server:8001
       RERANK_SERVER_URL: http://rerank-server:8002
       API_SERVER_URL: http://api-server:8000   # 登录走容器内权限后端，替换硬编码 localhost:8000
+      # ⚠️ 必须显式注入：.env 里的 LANGFUSE_HOST=localhost:3000 在容器内指向容器自己，
+      #    上报会全部失败（降级安全不崩，但 trace 全丢）。实测 host.docker.internal 可通。
+      #    config.py 的 load_dotenv 不覆盖已有环境变量，故此处注入生效。
+      LANGFUSE_HOST: http://host.docker.internal:3000
       # ⚠️ 必须显式注入：config 默认 localhost:6379，容器内连不到 → 限流器单例
       # 初始化失败后会永久保持「降级放行」，直到进程重启
       REDIS_HOST: redis
@@ -106,6 +114,8 @@ services:
       RUNTIME_DATA_DIR: /app/runtime_data
     volumes:
       - D:/VsCode/AI/.cache/huggingface:/root/.cache/huggingface
+      # PaddleOCR 模型缓存（首次 OCR 时下载，落 D 盘避免容器重建后重新下载）
+      - D:/VsCode/AI/.cache/paddleocr:/root/.paddleocr
       # ChromaDB 向量库 + 上传文档 落宿主机（数据持久化）
       - ./chroma_db:/app/chroma_db
       - ./uploaded_docs:/app/uploaded_docs

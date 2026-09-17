@@ -49,10 +49,14 @@ class Scheduler:
         self.permissions = permissions  # 请求级工具权限（None=不限，不校验）
         self.user_id = user_id  # 请求级用户身份（写入审计，供按用户聚合）
         try:
-            from config import TOOL_PERMISSION_ENABLED
-            self.tool_perm_enabled = TOOL_PERMISSION_ENABLED
+            import config as _cfg
+            # 逐项 getattr：某个键缺失（旧 config 混装）时只降级该项，
+            # 不会因整段 import 失败而静默把鉴权全关掉
+            self.tool_perm_enabled = getattr(_cfg, "TOOL_PERMISSION_ENABLED", False)
+            self.tool_perm_strict = getattr(_cfg, "TOOL_PERMISSION_STRICT", False)
         except Exception:
             self.tool_perm_enabled = False  # 降级：默认关闭鉴权
+            self.tool_perm_strict = False
 
     async def execute(
         self,
@@ -110,7 +114,7 @@ class Scheduler:
         start = time.time()
 
         # 0. 工具级权限校验（收口，fail-closed：未声明权限的敏感工具默认拒绝）
-        if self.tool_perm_enabled and self.permissions is not None:
+        if self._perm_check_active():
             # 先区分「工具不存在」与「权限不足」：两者都 fail-closed，
             # 但混报成「权限拒绝」会把排查方向引向 RBAC ——
             # 实际原因通常是 LLM 编了工具名（如把 Skill 名当工具调）。
@@ -209,6 +213,26 @@ class Scheduler:
             }
 
     # ── 工具权限校验 ──────────────────────────────────────────
+
+    def _perm_check_active(self) -> bool:
+        """本次调用是否执行工具级校验。
+
+        permissions 非 None → 校验（正常路径，身份来自登录态）。
+        permissions 为 None → 默认跳过（零破坏：直连调试/未登录路径行为不变）；
+        严格模式（TOOL_PERMISSION_STRICT=True）下仍校验——此时 permissions 为 None
+        在 _check_tool_permission 里按「空权限集」参与比对，受控工具全部拒绝，
+        避免「忘传身份 = 全放行」。
+        """
+        if not self.tool_perm_enabled:
+            return False
+        if self.permissions is not None:
+            return True
+        if self.tool_perm_strict:
+            logger.warning(
+                "工具鉴权严格模式：本次调用未传 permissions，按空权限集校验（受控工具将全部拒绝）"
+            )
+            return True
+        return False
 
     def _check_tool_permission(self, tool_name: str) -> str | None:
         """工具级权限校验：返回缺失的权限名（None=有权限/公开）。

@@ -52,6 +52,14 @@ class SkillExecutor:
         self.permissions = permissions  # 请求级工具权限（None=不限，不校验）
         self.user_id = user_id  # 请求级用户身份（写入审计，供按用户聚合）
         self._logs: list[dict] = []
+        try:
+            import config as _cfg
+            # 与 scheduler 读同一套开关（两条路径必须对称，否则关掉开关仍有一条在鉴权）
+            self.tool_perm_enabled = getattr(_cfg, "TOOL_PERMISSION_ENABLED", False)
+            self.tool_perm_strict = getattr(_cfg, "TOOL_PERMISSION_STRICT", False)
+        except Exception:
+            self.tool_perm_enabled = False  # 降级：默认关闭鉴权
+            self.tool_perm_strict = False
 
     # ── 主入口 ────────────────────────────────────────────────
 
@@ -190,7 +198,7 @@ class SkillExecutor:
         filled_args = self._fill_args(step_args, args)
 
         # 工具级权限校验（Skill 路径收口，与 scheduler 一致）
-        if self.permissions is not None and self.registry is not None:
+        if self._perm_check_active() and self.registry is not None:
             # 先区分「工具不存在」与「权限不足」（同 scheduler：避免误导成 RBAC 问题）
             if self.registry.get(tool_name) is None:
                 self._log("tool_missing", f"步骤 {index}: 工具不存在 {tool_name}")
@@ -373,6 +381,23 @@ class SkillExecutor:
         return response.choices[0].message.content or "（无法生成回答）"
 
     # ── 工具方法 ──────────────────────────────────────────────
+
+    def _perm_check_active(self) -> bool:
+        """本次调用是否执行工具级校验（与 scheduler._perm_check_active 逻辑一致）。
+
+        permissions 非 None → 校验；None → 默认跳过（零破坏），
+        严格模式（TOOL_PERMISSION_STRICT=True）下按「空权限集」校验，受控工具全部拒绝。
+        """
+        if not self.tool_perm_enabled:
+            return False
+        if self.permissions is not None:
+            return True
+        if self.tool_perm_strict:
+            logger.warning(
+                "工具鉴权严格模式：本次调用未传 permissions，按空权限集校验（受控工具将全部拒绝）"
+            )
+            return True
+        return False
 
     def _check_tool_permission(self, tool_name: str) -> str | None:
         """工具级权限校验（与 scheduler._check_tool_permission 逻辑一致）。"""

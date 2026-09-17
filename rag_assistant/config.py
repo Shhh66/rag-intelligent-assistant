@@ -198,6 +198,9 @@ LLM_RATE_LIMIT_REFILL = 0.5       # 每秒补充令牌数（= 30 次/分钟）
 
 # ===== 工具鉴权配置（P4）=====
 TOOL_PERMISSION_ENABLED = True    # 工具级权限总开关（默认开；启动期校验兜底防漏配）
+TOOL_PERMISSION_STRICT = False    # 严格模式：permissions=None（没传用户身份）时按「空权限集」校验，
+                                  # 受控工具全部拒绝（fail-closed）。默认 False = 保持零破坏
+                                  # （None 跳过校验，兼容直连调试/未登录路径）；生产建议置 True
 
 # ===== Markdown 分块配置 =====
 CHUNK_MERGE_RATIO = 1 / 3         # 章节长度 < chunk_size 的 1/3 → 合并到相邻同级章节

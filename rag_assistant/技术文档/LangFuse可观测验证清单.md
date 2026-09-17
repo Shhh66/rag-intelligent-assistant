@@ -90,6 +90,42 @@ docker compose exec main python -c "import config; print(config.LANGFUSE_CAPTURE
 
 ---
 
+## 阶段 P2：ReAct 轮次分组 + memory 耗时
+
+### P2-1 每一轮成为可折叠的父节点
+
+**访问路径**：点开 trace，看树形结构
+
+- [ ] 出现 `ReAct 第 1 轮`、`ReAct 第 2 轮`…… 的父节点
+- [ ] 该轮内的 `decision_engine.decide` / `工具:xxx` / `judge_evaluate` **嵌在对应轮次之下**，不再平铺在 trace 根
+- [ ] 每个轮次节点的 Metadata 里有 `turn` 字段
+- [ ] `memory.extract` 等收尾节点嵌在**触发它的那一轮**之下（它在该轮 return 之前执行）
+
+**期望的树形**：
+
+```
+chat
+├─ ReAct 第 1 轮
+│   ├─ decision_engine.decide
+│   ├─ 工具:query_weather
+│   ├─ judge_evaluate
+│   │   └─ judge.evaluate
+│   └─ memory.extract          ← 该轮收尾时执行
+├─ ReAct 第 2 轮
+│   └─ decision_engine.decide
+```
+
+> ⚠️ **必须问一个需要多轮的问题**才能看到分组效果，例如「帮我查一下北京和上海的天气，
+> 然后对比哪个更适合旅游」。单轮就结束的问题（如「北京天气怎么样」）只会显示
+> `ReAct 第 1 轮` 一个父节点 —— 这是正常的，不是 bug。
+
+### P2-2 memory 耗时不再是 0.00s
+
+- [ ] `memory.extract` 显示真实耗时（通常几百 ms ~ 数秒），不再是 `0.00s`
+- [ ] 若本次触发了 `memory.summarize` / `memory.extract_summary`，它们同样有真实耗时
+
+---
+
 ## 边界场景（建议一并核对）
 
 ### B-1 RAG 检索链路的 span（跨进程验证）
@@ -110,13 +146,13 @@ docker compose exec main python -c "import config; print(config.LANGFUSE_CAPTURE
 
 ---
 
-## 预期仍为空 / 已知未做（不是 bug）
+## 已知未做（不是 bug）
 
 | 现象 | 原因 |
 |---|---|
-| ReAct 各轮节点**平铺**，看不出「第 1 轮 / 第 2 轮」边界 | **P2 未实施**（轮次分组） |
-| `memory.extract` 耗时显示 `0.00s` | **P2 未实施**（latency 未传） |
 | Evaluation / Prompt 管理两个大功能不存在 | 项目未接 LangFuse 的 score 与 prompt 体系（RAGAS 是独立体系） |
+| trace 的 Name 固定为 `chat` | 未做动态命名 |
+| 只看到 `ReAct 第 1 轮`，没有第 2 轮 | 该问题一轮就结束了，正常 |
 
 ---
 

@@ -16,6 +16,7 @@ import json
 import logging
 import os
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,12 @@ def _get_client():
 # 当前请求的观测上下文。主进程由 set_obs_context() 显式设置；
 # MCP 子进程是 per-request 新建的、拿不到主进程状态，故回落到读环境变量。
 _ctx = {"trace_id": "", "user_id": "", "session_id": ""}
+
+# 当前所在的 span。用于 span 嵌套：进入一个 span 后，其作用域内创建的
+# span/generation 自动挂为它的子节点（ReAct 轮次分组即靠此实现）。
+# 用 ContextVar 而非全局变量 —— Streamlit 多会话线程 / 多协程并发时互不串台；
+# MCP 子进程里默认 None，行为与改造前一致。
+_current_span: ContextVar = ContextVar("obs_current_span", default=None)
 
 
 def set_obs_context(trace_id="", user_id="", session_id=""):
@@ -101,6 +108,9 @@ def _get_trace(client, trace_id):
 def obs_span(name, trace_id="", metadata=None, level="DEFAULT", input=None, output=None):
     """一个 span 上下文管理器；LangFuse 不可用时是纯 no-op。
 
+    支持嵌套：若当前已在某个 span 作用域内（如 ReAct 轮次 span），新 span 自动
+    挂为它的子节点 —— 轮次内的决策 / 工具调用 / Judge 因此在 UI 上自然成组。
+
     input/output 均为创建时写入（调用方需在进入前就拿到结果，如工具调用的
     result_preview），不是退出时回填。
     """
@@ -108,9 +118,11 @@ def obs_span(name, trace_id="", metadata=None, level="DEFAULT", input=None, outp
     if client is None:
         yield None
         return
+    parent = _current_span.get()
     span = None
     try:
-        span = _get_trace(client, trace_id).span(
+        target = parent if parent is not None else _get_trace(client, trace_id)
+        span = target.span(
             name=name,
             metadata=metadata or {},
             level=level,
@@ -120,9 +132,12 @@ def obs_span(name, trace_id="", metadata=None, level="DEFAULT", input=None, outp
     except Exception as e:
         logger.debug(f"obs_span 创建失败(忽略): {e}")
         span = None
+    token = _current_span.set(span) if span is not None else None
     try:
         yield span
     finally:
+        if token is not None:
+            _current_span.reset(token)
         if span is not None:
             try:
                 span.end()
@@ -156,7 +171,10 @@ def obs_generation(trace_id="", name="llm", model=None, usage=None,
         end_t = datetime.now(timezone.utc)
         start_t = end_t - timedelta(milliseconds=latency_ms) if latency_ms else end_t
 
-        gen = _get_trace(client, trace_id).generation(
+        # 与 obs_span 一致：身处某个 span 作用域内时挂为其子节点（轮次分组）
+        parent = _current_span.get()
+        target = parent if parent is not None else _get_trace(client, trace_id)
+        gen = target.generation(
             name=name,
             model=model,
             usage=usage_payload,

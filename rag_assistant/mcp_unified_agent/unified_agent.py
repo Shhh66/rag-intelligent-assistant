@@ -457,245 +457,251 @@ class UnifiedAgent:
             return hashlib.md5(sig_str.encode()).hexdigest()[:12]
 
         for turn in range(self.max_turns):
-            logger.info(f"=== 第 {turn + 1}/{self.max_turns} 轮决策 ===")
+            from observability import obs_span
+            with obs_span(
+                f"ReAct 第 {turn + 1} 轮",
+                trace_id=scheduler.trace_id,
+                metadata={"turn": turn + 1},
+            ):
+                logger.info(f"=== 第 {turn + 1}/{self.max_turns} 轮决策 ===")
 
-            # 1. 工具预筛选
-            if turn == 0 and self._vector_filter_ready and self._tool_filter:
-                candidate_names = self._tool_filter.filter(user_input)
-                candidate_tools = tool_registry.get_by_names(candidate_names)
-                logger.info(f"向量预筛选: {len(candidate_tools)}/{tool_registry.count}")
-            else:
-                candidate_tools = tool_registry.get_all()
+                # 1. 工具预筛选
+                if turn == 0 and self._vector_filter_ready and self._tool_filter:
+                    candidate_names = self._tool_filter.filter(user_input)
+                    candidate_tools = tool_registry.get_by_names(candidate_names)
+                    logger.info(f"向量预筛选: {len(candidate_tools)}/{tool_registry.count}")
+                else:
+                    candidate_tools = tool_registry.get_all()
 
-            # 2. 长期记忆检索注入（跨会话，按用户隔离）
-            # 注：原先还有一路「历史工具选型」提示（内存态反思记忆），实测匹配精度
-            # 不足（字符 bigram 分数分布完全重叠、误召漏召并存），已移除。
-            # 长期记忆只存「从单轮问题里读不出来的用户信息」（画像/约束/项目背景），
-            # 不存工具使用习惯——工具由当前问题决定，存了也用不上。详见
-            # 技术文档/长期记忆.md 第十节。
-            hints = []
-            if HAS_LONG_MEMORY:
-                try:
-                    hints = list(get_memory().retrieve(self._current_user_id(), user_input))
-                except Exception:
-                    pass
-            # 将前序轮次的工具结果注入提示，避免 LLM 不知情重复调用
-            if all_results:
-                for r in all_results[-5:]:  # 最近 5 条
-                    status = "失败" if r.get("is_error") else "成功"
-                    hints.append(
-                        f"[本轮已执行] 工具「{r['tool_name']}」→ {status}: "
-                        f"{str(r.get('result', ''))[:120]}"
-                    )
-
-            # 3. LLM 决策（五阶段：Plan → Thought → Action → Observation → Evaluation → Decision）
-            # 不注入 Skill 候选：Skill 入口是上面的「前置匹配」，ReAct 循环内调不动 Skill
-            # （action 枚举只有 call_tools/direct_answer，call_skill 分支不可达）。
-            # 曾经把 Skill 当「高级工具」宣传给 LLM，导致它用 call_tools 调 Skill 名 → 必然失败。
-            decision = decision_engine.decide_with_skills(
-                user_input=user_input,
-                history=self._history,
-                tools=candidate_tools,
-                reflection_hints=hints,
-                skills_candidates=None,
-                turn=turn,
-                current_plan=current_plan,
-            )
-
-            # 记录首轮规划
-            if turn == 0 and decision.plan:
-                current_plan = decision.plan
-                logger.info(f"规划: {current_plan[:200]}")
-
-            logger.info(
-                f"决策: action={decision.action}, "
-                f"skill={decision.skill_name}, "
-                f"tools={[t.tool_name for t in decision.tools]}, "
-                f"mode={decision.execution_mode}, "
-                f"decision={decision.decision}, "
-                f"evaluation={decision.evaluation[:100] if decision.evaluation else ''}"
-            )
-
-            # 思考留痕：记录本轮 ReAct 决策（合规「每一步思考可回溯」）
-            try:
-                from tool_audit import log_decision
-                log_decision(
-                    trace_id=scheduler.trace_id,
-                    turn=turn,
-                    action=decision.action,
-                    thought=decision.thought,
-                    tool_names=[t.tool_name for t in decision.tools],
-                    skill_name=decision.skill_name,
-                    plan=decision.plan,
-                    evaluation=decision.evaluation,
-                    decision=decision.decision,
-                    user_id=scheduler.user_id,
-                )
-            except Exception:
-                pass
-
-            # 4. 直接回答 → 返回（含 abort 场景）
-            if decision.action == "direct_answer":
-                answer = decision.direct_response or "（无法生成回答）"
-                self._record_conversation(user_input, answer)
-                return answer
-
-            # 4b. 死循环检测：连续 N 次相同工具签名 → 强制终止
-            if decision.tools:
-                for t in decision.tools:
-                    sig = _tool_signature(t.tool_name, t.arguments)
-                    tool_call_signatures.append(sig)
-
-                # 检查最近 N 个签名是否全部相同
-                if len(tool_call_signatures) >= LOOP_DETECTION_THRESHOLD:
-                    recent = tool_call_signatures[-LOOP_DETECTION_THRESHOLD:]
-                    if len(set(recent)) == 1:
-                        logger.warning(
-                            f"死循环检测触发：连续 {LOOP_DETECTION_THRESHOLD} 次相同工具调用 "
-                            f"({decision.tools[0].tool_name})"
-                        )
-                        answer = decision_engine.final_answer(
-                            user_input=user_input,
-                            history=self._history,
-                            tool_results=all_results,
-                        )
-                        self._record_conversation(user_input, answer)
-                        return answer
-
-            # 4c. 调用 Skill（ReAct 循环内）→ 通过 SkillExecutor
-            if decision.action == "call_skill" and decision.skill_name:
-                skill = self._skill_registry.get(decision.skill_name) if self._skill_registry else None
-                if skill:
+                # 2. 长期记忆检索注入（跨会话，按用户隔离）
+                # 注：原先还有一路「历史工具选型」提示（内存态反思记忆），实测匹配精度
+                # 不足（字符 bigram 分数分布完全重叠、误召漏召并存），已移除。
+                # 长期记忆只存「从单轮问题里读不出来的用户信息」（画像/约束/项目背景），
+                # 不存工具使用习惯——工具由当前问题决定，存了也用不上。详见
+                # 技术文档/长期记忆.md 第十节。
+                hints = []
+                if HAS_LONG_MEMORY:
                     try:
-                        executor = SkillExecutor(mcp_session, step_timeout=self.call_timeout, trace_id=scheduler.trace_id,
-                                                 registry=tool_registry, permissions=scheduler.permissions,
-                                                 user_id=scheduler.user_id)
-                        answer = await executor.execute(skill, decision.skill_args)
-                        self._record_conversation(user_input, answer)
-                        return answer
-                    except SkillExecutionError as e:
-                        logger.warning(f"ReAct 内 Skill 执行失败: {e}，继续下一轮")
-                        hints.append(f"[本轮已执行] Skill「{decision.skill_name}」→ 失败: {str(e)[:120]}")
-                        continue
-
-            # 5. 执行工具调用
-            if not decision.tools:
-                break
-
-            results = await scheduler.execute(
-                decision.tools, decision.execution_mode
-            )
-            all_results.extend(results)
-
-            # 6. 工具已执行完毕，结果进入下一轮上下文（见上方 all_results 收集）
-            # ── 工具结果处理 ──
-            success_count = sum(1 for r in results if not r.get("is_error"))
-            all_failed = success_count == 0
-
-            # 5b. 独立 Judge 模型判断信息是否足够
-            # 位置说明：必须放在「记录反思」之后、`if not all_failed` 之前——
-            # 否则 Judge 说 No 只会打一行日志，紧接着被「任一工具成功即返回」覆盖，
-            # 判定形同虚设（位置错了，逻辑就等于没有）。
-            from config import JUDGE_ENABLED
-            if JUDGE_ENABLED:
-                try:
-                    from judge import get_judge
-                    from observability import obs_span
-                    judge = get_judge()
-
-                    # 格式化已收集信息
-                    collected_info = self._format_collected_info(all_results)
-
-                    # LangFuse 记录 Judge span
-                    with obs_span(
-                        name="judge_evaluate",
-                        trace_id=scheduler.trace_id,
-                        metadata={
-                            "round": turn,
-                            "collected_info_length": len(collected_info),
-                        },
-                        input=user_input,
-                    ):
-                        judge_result = judge.evaluate(
-                            task_goal=user_input,
-                            collected_info=collected_info,
-                            user_query=user_input,
-                            round_idx=turn,
-                        )
-
-                    # 审计日志记录 Judge 结果
-                    try:
-                        from tool_audit import log_decision
-                        log_decision(
-                            trace_id=scheduler.trace_id,
-                            turn=turn,
-                            action="judge",
-                            thought=f"Judge: {judge_result.decision}",
-                            tool_names=[],
-                            skill_name="",
-                            plan=current_plan,
-                            evaluation=judge_result.raw_output,
-                            decision=judge_result.decision.lower(),
-                            user_id=scheduler.user_id,
-                        )
+                        hints = list(get_memory().retrieve(self._current_user_id(), user_input))
                     except Exception:
                         pass
-
-                    if judge_result.is_sufficient:
-                        logger.info(
-                            f"[Judge] Round {turn}: 信息足够，直接生成答案"
+                # 将前序轮次的工具结果注入提示，避免 LLM 不知情重复调用
+                if all_results:
+                    for r in all_results[-5:]:  # 最近 5 条
+                        status = "失败" if r.get("is_error") else "成功"
+                        hints.append(
+                            f"[本轮已执行] 工具「{r['tool_name']}」→ {status}: "
+                            f"{str(r.get('result', ''))[:120]}"
                         )
-                        answer = decision_engine.final_answer(
-                            user_input=user_input,
-                            history=self._history,
-                            tool_results=all_results,
-                        )
-                        self._record_conversation(user_input, answer)
-                        return answer
 
-                    # 信息不足 → 真正进入下一轮继续收集
-                    logger.info(f"[Judge] Round {turn}: 信息不足，继续下一轮")
-                    continue
-                except Exception as e:
-                    # Judge 不可用 → 降级到原有逻辑（任一工具成功即汇总返回）
-                    logger.warning(f"[Judge] 调用失败，降级到原有逻辑: {e}")
-
-            if not all_failed:
-                # 有至少一个工具成功：统一走 final_answer 汇总
-                # （不再抄近路直接返回原始结果——query_weather 等工具的
-                #  原始输出需要 LLM 加工才能变成用户可读的自然语言）
-                if len(decision.tools) > 1:
-                    logger.info(
-                        f"{success_count}/{len(decision.tools)} 个工具成功，"
-                        f"直接汇总"
-                    )
-                answer = decision_engine.final_answer(
+                # 3. LLM 决策（五阶段：Plan → Thought → Action → Observation → Evaluation → Decision）
+                # 不注入 Skill 候选：Skill 入口是上面的「前置匹配」，ReAct 循环内调不动 Skill
+                # （action 枚举只有 call_tools/direct_answer，call_skill 分支不可达）。
+                # 曾经把 Skill 当「高级工具」宣传给 LLM，导致它用 call_tools 调 Skill 名 → 必然失败。
+                decision = decision_engine.decide_with_skills(
                     user_input=user_input,
                     history=self._history,
-                    tool_results=all_results,
+                    tools=candidate_tools,
+                    reflection_hints=hints,
+                    skills_candidates=None,
+                    turn=turn,
+                    current_plan=current_plan,
                 )
-                self._record_conversation(user_input, answer)
-                return answer
 
-            # 工具失败 → 记录失败信息，下一轮 LLM 会看到 accumulated 结果
-            failed_names = [
-                r["tool_name"] for r in results
-                if r.get("is_error")
-            ]
-            if failed_names:
-                logger.warning(f"工具失败: {failed_names}，将在下一轮决策中提示 LLM")
+                # 记录首轮规划
+                if turn == 0 and decision.plan:
+                    current_plan = decision.plan
+                    logger.info(f"规划: {current_plan[:200]}")
 
-            # 成本控制：单任务 Token 预算检查（超预算强制终止返回中间结果）
-            if task_budget > 0:
+                logger.info(
+                    f"决策: action={decision.action}, "
+                    f"skill={decision.skill_name}, "
+                    f"tools={[t.tool_name for t in decision.tools]}, "
+                    f"mode={decision.execution_mode}, "
+                    f"decision={decision.decision}, "
+                    f"evaluation={decision.evaluation[:100] if decision.evaluation else ''}"
+                )
+
+                # 思考留痕：记录本轮 ReAct 决策（合规「每一步思考可回溯」）
                 try:
-                    from model_gateway import check_budget
-                    if check_budget(task_budget):
-                        logger.warning(
-                            f"单任务 Token 预算耗尽（{task_budget}），强制终止"
-                        )
-                        break
+                    from tool_audit import log_decision
+                    log_decision(
+                        trace_id=scheduler.trace_id,
+                        turn=turn,
+                        action=decision.action,
+                        thought=decision.thought,
+                        tool_names=[t.tool_name for t in decision.tools],
+                        skill_name=decision.skill_name,
+                        plan=decision.plan,
+                        evaluation=decision.evaluation,
+                        decision=decision.decision,
+                        user_id=scheduler.user_id,
+                    )
                 except Exception:
                     pass
+
+                # 4. 直接回答 → 返回（含 abort 场景）
+                if decision.action == "direct_answer":
+                    answer = decision.direct_response or "（无法生成回答）"
+                    self._record_conversation(user_input, answer)
+                    return answer
+
+                # 4b. 死循环检测：连续 N 次相同工具签名 → 强制终止
+                if decision.tools:
+                    for t in decision.tools:
+                        sig = _tool_signature(t.tool_name, t.arguments)
+                        tool_call_signatures.append(sig)
+
+                    # 检查最近 N 个签名是否全部相同
+                    if len(tool_call_signatures) >= LOOP_DETECTION_THRESHOLD:
+                        recent = tool_call_signatures[-LOOP_DETECTION_THRESHOLD:]
+                        if len(set(recent)) == 1:
+                            logger.warning(
+                                f"死循环检测触发：连续 {LOOP_DETECTION_THRESHOLD} 次相同工具调用 "
+                                f"({decision.tools[0].tool_name})"
+                            )
+                            answer = decision_engine.final_answer(
+                                user_input=user_input,
+                                history=self._history,
+                                tool_results=all_results,
+                            )
+                            self._record_conversation(user_input, answer)
+                            return answer
+
+                # 4c. 调用 Skill（ReAct 循环内）→ 通过 SkillExecutor
+                if decision.action == "call_skill" and decision.skill_name:
+                    skill = self._skill_registry.get(decision.skill_name) if self._skill_registry else None
+                    if skill:
+                        try:
+                            executor = SkillExecutor(mcp_session, step_timeout=self.call_timeout, trace_id=scheduler.trace_id,
+                                                     registry=tool_registry, permissions=scheduler.permissions,
+                                                     user_id=scheduler.user_id)
+                            answer = await executor.execute(skill, decision.skill_args)
+                            self._record_conversation(user_input, answer)
+                            return answer
+                        except SkillExecutionError as e:
+                            logger.warning(f"ReAct 内 Skill 执行失败: {e}，继续下一轮")
+                            hints.append(f"[本轮已执行] Skill「{decision.skill_name}」→ 失败: {str(e)[:120]}")
+                            continue
+
+                # 5. 执行工具调用
+                if not decision.tools:
+                    break
+
+                results = await scheduler.execute(
+                    decision.tools, decision.execution_mode
+                )
+                all_results.extend(results)
+
+                # 6. 工具已执行完毕，结果进入下一轮上下文（见上方 all_results 收集）
+                # ── 工具结果处理 ──
+                success_count = sum(1 for r in results if not r.get("is_error"))
+                all_failed = success_count == 0
+
+                # 5b. 独立 Judge 模型判断信息是否足够
+                # 位置说明：必须放在「记录反思」之后、`if not all_failed` 之前——
+                # 否则 Judge 说 No 只会打一行日志，紧接着被「任一工具成功即返回」覆盖，
+                # 判定形同虚设（位置错了，逻辑就等于没有）。
+                from config import JUDGE_ENABLED
+                if JUDGE_ENABLED:
+                    try:
+                        from judge import get_judge
+                        from observability import obs_span
+                        judge = get_judge()
+
+                        # 格式化已收集信息
+                        collected_info = self._format_collected_info(all_results)
+
+                        # LangFuse 记录 Judge span
+                        with obs_span(
+                            name="judge_evaluate",
+                            trace_id=scheduler.trace_id,
+                            metadata={
+                                "round": turn,
+                                "collected_info_length": len(collected_info),
+                            },
+                            input=user_input,
+                        ):
+                            judge_result = judge.evaluate(
+                                task_goal=user_input,
+                                collected_info=collected_info,
+                                user_query=user_input,
+                                round_idx=turn,
+                            )
+
+                        # 审计日志记录 Judge 结果
+                        try:
+                            from tool_audit import log_decision
+                            log_decision(
+                                trace_id=scheduler.trace_id,
+                                turn=turn,
+                                action="judge",
+                                thought=f"Judge: {judge_result.decision}",
+                                tool_names=[],
+                                skill_name="",
+                                plan=current_plan,
+                                evaluation=judge_result.raw_output,
+                                decision=judge_result.decision.lower(),
+                                user_id=scheduler.user_id,
+                            )
+                        except Exception:
+                            pass
+
+                        if judge_result.is_sufficient:
+                            logger.info(
+                                f"[Judge] Round {turn}: 信息足够，直接生成答案"
+                            )
+                            answer = decision_engine.final_answer(
+                                user_input=user_input,
+                                history=self._history,
+                                tool_results=all_results,
+                            )
+                            self._record_conversation(user_input, answer)
+                            return answer
+
+                        # 信息不足 → 真正进入下一轮继续收集
+                        logger.info(f"[Judge] Round {turn}: 信息不足，继续下一轮")
+                        continue
+                    except Exception as e:
+                        # Judge 不可用 → 降级到原有逻辑（任一工具成功即汇总返回）
+                        logger.warning(f"[Judge] 调用失败，降级到原有逻辑: {e}")
+
+                if not all_failed:
+                    # 有至少一个工具成功：统一走 final_answer 汇总
+                    # （不再抄近路直接返回原始结果——query_weather 等工具的
+                    #  原始输出需要 LLM 加工才能变成用户可读的自然语言）
+                    if len(decision.tools) > 1:
+                        logger.info(
+                            f"{success_count}/{len(decision.tools)} 个工具成功，"
+                            f"直接汇总"
+                        )
+                    answer = decision_engine.final_answer(
+                        user_input=user_input,
+                        history=self._history,
+                        tool_results=all_results,
+                    )
+                    self._record_conversation(user_input, answer)
+                    return answer
+
+                # 工具失败 → 记录失败信息，下一轮 LLM 会看到 accumulated 结果
+                failed_names = [
+                    r["tool_name"] for r in results
+                    if r.get("is_error")
+                ]
+                if failed_names:
+                    logger.warning(f"工具失败: {failed_names}，将在下一轮决策中提示 LLM")
+
+                # 成本控制：单任务 Token 预算检查（超预算强制终止返回中间结果）
+                if task_budget > 0:
+                    try:
+                        from model_gateway import check_budget
+                        if check_budget(task_budget):
+                            logger.warning(
+                                f"单任务 Token 预算耗尽（{task_budget}），强制终止"
+                            )
+                            break
+                    except Exception:
+                        pass
 
         # 达到最大轮次：强制汇总
         logger.info(f"达到最大轮次，汇总 {len(all_results)} 条结果")

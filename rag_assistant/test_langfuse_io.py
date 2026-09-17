@@ -232,5 +232,85 @@ finally:
     config.LANGFUSE_CAPTURE_IO = _orig_flag
 _check(not fake2.sink["updates"], "[开关关] trace 顶层入参/出参同样不写")
 
+# ══════════════════════════════════════════════
+# 7. P2：span 嵌套（ReAct 轮次分组）+ memory 耗时
+# ══════════════════════════════════════════════
+class _SpanNode:
+    """假 span：既作为节点被记录，也能创建子节点，用于断言父子关系。"""
+
+    def __init__(self, name):
+        self.name = name
+        self.children = []
+
+    def span(self, **kw):
+        child = _SpanNode(kw.get("name"))
+        self.children.append(child)
+        return child
+
+    def generation(self, **kw):
+        child = _SpanNode(f"<gen>{kw.get('name')}</gen>")
+        self.children.append(child)
+        return child
+
+    def end(self):
+        pass
+
+    def update(self, **kw):
+        pass
+
+
+class _TraceNode(_SpanNode):
+    def __init__(self):
+        super().__init__("<trace>")
+
+
+class _NestClient:
+    def __init__(self):
+        self.root = _TraceNode()
+
+    def trace(self, **kw):
+        return self.root
+
+
+nest = _NestClient()
+observability._get_client = lambda: nest
+try:
+    with observability.obs_span("ReAct 第 1 轮", trace_id="a" * 32):
+        with observability.obs_span("工具:demo", trace_id="a" * 32):
+            pass
+        observability.obs_generation(trace_id="a" * 32, name="decide", model="m")
+    # 退出轮次作用域后再上报 → 应回到 trace 根，而非留在轮次里
+    observability.obs_generation(trace_id="a" * 32, name="orphan", model="m")
+    left_in_scope = observability._current_span.get()
+finally:
+    observability._get_client = _orig_client
+
+_root_names = [c.name for c in nest.root.children]
+_check(_root_names == ["ReAct 第 1 轮", "<gen>orphan</gen>"],
+       "trace 根下只有轮次 span 与轮次外节点，顺序正确")
+_round1 = nest.root.children[0]
+_child_names = [c.name for c in _round1.children]
+_check("工具:demo" in _child_names, "轮次内的工具 span 自动成为子节点")
+_check("<gen>decide</gen>" in _child_names, "轮次内的 LLM generation 自动成为子节点")
+_check("<gen>orphan</gen>" not in _child_names, "退出轮次后的节点未误挂进上一轮")
+_check(left_in_scope is None, "退出后 _current_span 复位为 None（不泄漏到下一次请求）")
+
+# 嵌套与 LangFuse 不可用时的降级互不干扰
+observability._get_client = lambda: None
+try:
+    with observability.obs_span("no-op 轮次", trace_id="a" * 32) as _noop:
+        observability.obs_generation(trace_id="a" * 32, name="x", model="m")
+    _noop_after = observability._current_span.get()
+finally:
+    observability._get_client = _orig_client
+_check(_noop is None and _noop_after is None, "LangFuse 不可用时嵌套路径仍是纯 no-op")
+
+# memory 三处记账均补上耗时（源码级防回归）
+import inspect as _inspect
+import long_term_memory as _ltm
+_src = _inspect.getsource(_ltm)
+_check(_src.count("latency_ms=(time.monotonic() - _t0) * 1000") == 3,
+       "memory 的 extract / extract_summary / summarize 三处均补上 latency_ms")
+
 print("\n".join(f"✅ {p}" for p in PASS))
 print(f"\n🎉 全部通过（{len(PASS)} 项断言，零 API 成本）")

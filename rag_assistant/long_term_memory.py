@@ -17,6 +17,7 @@
 
 import os
 import sys
+import time
 import json
 import sqlite3
 import logging
@@ -330,6 +331,7 @@ class LongTermMemory:
 
         try:
             prompt = build_memory_extract_prompt(summary)
+            _t0 = time.monotonic()
             resp = self._llm_client().chat.completions.create(
                 model=LLM_MODEL,
                 messages=[{"role": "user", "content": prompt}],
@@ -339,7 +341,8 @@ class LongTermMemory:
             try:
                 from token_tracker import get_tracker
                 get_tracker().record(LLM_MODEL, resp.usage,
-                                     call_site="memory.extract_summary")
+                                     call_site="memory.extract_summary",
+                                     latency_ms=(time.monotonic() - _t0) * 1000)
             except Exception:
                 pass
             text = (resp.choices[0].message.content or "").strip()
@@ -374,6 +377,7 @@ class LongTermMemory:
             "没有值得记的就输出 []。只输出 JSON，不要解释。\n\n"
             f"用户：{user_input}\n助手：{answer[:500]}"
         )
+        _t0 = time.monotonic()
         resp = self._llm_client().chat.completions.create(
             model=LLM_MODEL,
             messages=[{"role": "user", "content": prompt}],
@@ -382,7 +386,8 @@ class LongTermMemory:
         )
         if get_tracker:
             try:
-                get_tracker().record(LLM_MODEL, resp.usage, call_site="memory.extract")
+                get_tracker().record(LLM_MODEL, resp.usage, call_site="memory.extract",
+                                     latency_ms=(time.monotonic() - _t0) * 1000)
             except Exception:
                 pass
         text = (resp.choices[0].message.content or "").strip()
@@ -391,6 +396,7 @@ class LongTermMemory:
     def _llm_summarize(self, user_input, answer):
         """V0.5：生成一句对话摘要（实体抽取为空时的兜底，会真实产生一次 LLM 调用）。"""
         from config import LLM_MODEL, MEMORY_EXTRACT_MAX_TOKENS
+        _t0 = time.monotonic()
         resp = self._llm_client().chat.completions.create(
             model=LLM_MODEL,
             messages=[{"role": "user", "content":
@@ -401,7 +407,8 @@ class LongTermMemory:
         # 与 _llm_extract 保持一致：记账，否则走兜底路径时成本会漏统计
         try:
             from token_tracker import get_tracker
-            get_tracker().record(LLM_MODEL, resp.usage, call_site="memory.summarize")
+            get_tracker().record(LLM_MODEL, resp.usage, call_site="memory.summarize",
+                                 latency_ms=(time.monotonic() - _t0) * 1000)
         except Exception:
             pass
         return (resp.choices[0].message.content or "").strip()

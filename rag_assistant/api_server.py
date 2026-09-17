@@ -21,6 +21,7 @@ import jwt
 from config import (
     KB_PERMISSION_DB, KB_PERMISSION_SECRET_KEY,
     KB_PERMISSION_TOKEN_EXPIRE_HOURS,
+    KB_PERMISSION_SECRET_FALLBACK, KB_PERMISSION_REQUIRE_SECRET,
 )
 
 app = FastAPI(title="RAG 权限管理 API")
@@ -35,6 +36,47 @@ app.add_middleware(
 )
 
 security = HTTPBearer()
+
+
+# ═══════════════════════════════════════════════════════════════
+# 启动期配置校验
+# ═══════════════════════════════════════════════════════════════
+
+def _validate_secret_key():
+    """校验 JWT 签名密钥 —— 密钥不安全 = 任何人可自签 token 冒充任意用户。
+
+    三种状态分别处理：
+
+    - **配成空串**（.env 里写了 `KEY=` 却没填值）→ 直接报错。空串签不出 token
+      （PyJWT 抛 `InvalidKeyError`），与其等用户登录时才 500，不如启动期讲清楚。
+    - **完全未配置** → 回落代码内公开默认值，本地开发可接受，打显著警告；
+      设 `KB_PERMISSION_REQUIRE_SECRET=1` 则升级为启动失败，供生产/容器强制把关。
+    - **已配自定义值** → 直接通过。
+    """
+    key = KB_PERMISSION_SECRET_KEY
+
+    if not key.strip():
+        raise RuntimeError(
+            "[启动检查] KB_PERMISSION_SECRET_KEY 配置为空。\n"
+            "  空密钥无法签发 token，登录接口会直接报 InvalidKeyError。\n"
+            "  生成随机密钥填入 .env：python -c \"import secrets; print(secrets.token_hex(32))\""
+        )
+
+    if key != KB_PERMISSION_SECRET_FALLBACK:
+        return
+
+    msg = (
+        "[安全警告] KB_PERMISSION_SECRET_KEY 未配置，正在使用代码内的公开默认值 ——\n"
+        "  任何人都能自签 token 冒充任意用户（含 manage_users）。\n"
+        "  生成随机密钥填入 .env：python -c \"import secrets; print(secrets.token_hex(32))\"\n"
+        "  生产/容器部署请同时设 KB_PERMISSION_REQUIRE_SECRET=1 强制把关。"
+    )
+    if KB_PERMISSION_REQUIRE_SECRET:
+        raise RuntimeError("[启动检查] " + msg)
+    print(f"⚠️ {msg}", file=sys.stderr, flush=True)
+
+
+_validate_secret_key()
 
 
 # ═══════════════════════════════════════════════════════════════

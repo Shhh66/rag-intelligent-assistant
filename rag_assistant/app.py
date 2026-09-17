@@ -185,7 +185,7 @@ with st.sidebar:
         else:
             st.caption("可访问知识库: 全部（管理员）")
         if st.button("🚪 退出登录", use_container_width=True):
-            for k in ["auth_token", "auth_user", "kb_groups", "user_id"]:
+            for k in ["auth_token", "auth_user", "kb_groups", "user_id", "permissions"]:
                 st.session_state.pop(k, None)
             st.rerun()
 

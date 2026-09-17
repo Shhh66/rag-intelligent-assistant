@@ -151,7 +151,12 @@ RERANK_CALIBRATION_MAX_RATIO = 1.2          # 双语校准最大补偿倍数（�
 KB_DEFAULT_GROUP = "default"                 # 默认知识库分组
 KB_DEFAULT_VISIBILITY = "internal"           # 默认可见性（public | internal）
 KB_PERMISSION_DB = runtime_path("permission.db", "./permission.db")  # SQLite 权限数据库路径
-KB_PERMISSION_SECRET_KEY = os.getenv("KB_PERMISSION_SECRET_KEY", "rag-kb-secret-change-in-production")  # JWT 签名密钥（生产环境用 .env 覆盖）
+# JWT 签名密钥。未在 .env 配置 → 回落到下方公开默认值（仅限本地开发！）。
+# 显式配成空串属配置错误：api_server 启动时会直接报错（空密钥无法签发 token）。
+KB_PERMISSION_SECRET_FALLBACK = "rag-kb-secret-change-in-production"
+KB_PERMISSION_SECRET_KEY = os.getenv("KB_PERMISSION_SECRET_KEY", KB_PERMISSION_SECRET_FALLBACK)
+KB_PERMISSION_REQUIRE_SECRET = os.getenv("KB_PERMISSION_REQUIRE_SECRET", "").lower() in ("1", "true", "yes")
+                                          # 置 1 = 密钥仍为公开默认值时拒绝启动（生产/容器部署应开启）
 KB_PERMISSION_TOKEN_EXPIRE_HOURS = 24        # JWT Token 过期时间（小时）
 
 # ===== 模型服务化配置（部署运维改造）=====

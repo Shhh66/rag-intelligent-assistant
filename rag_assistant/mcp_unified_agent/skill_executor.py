@@ -212,13 +212,20 @@ class SkillExecutor:
 
         start = time.time()
         max_retries = 2 if is_retryable else 1
+        inner_retries = 0   # 累计 call_tool 内部的退避重试（外层每次尝试各算一遍）
+
+        def _inner(meta: dict) -> int:
+            """从 call_tool 回传的 meta 取内层重试次数（meta 未写入时视为 0）。"""
+            return max(0, (meta or {}).get("attempts", 1) - 1)
 
         for attempt in range(max_retries):
+            call_meta = {}
             try:
                 result = await asyncio.wait_for(
-                    self.mcp.call_tool(tool_name, filled_args),
+                    self.mcp.call_tool(tool_name, filled_args, meta=call_meta),
                     timeout=self.step_timeout,
                 )
+                inner_retries += _inner(call_meta)
 
                 text = self._extract_text(result)
                 is_error = getattr(result, 'isError', False)
@@ -229,7 +236,8 @@ class SkillExecutor:
 
                 self._log("step", f"步骤 {index}: {tool_name} 成功 ({latency:.0f}ms)",
                           {"tool": tool_name, "latency_ms": latency, "attempt": attempt + 1})
-                self._audit(tool_name, filled_args, text, True, latency, attempt)
+                self._audit(tool_name, filled_args, text, True, latency,
+                            attempt + inner_retries)
 
                 return {
                     "tool_name": tool_name,
@@ -241,22 +249,28 @@ class SkillExecutor:
                 }
 
             except asyncio.TimeoutError:
+                inner_retries += _inner(call_meta)
                 self._log("step_timeout", f"步骤 {index}: {tool_name} 超时 "
                           f"(attempt {attempt + 1}/{max_retries})")
                 if attempt + 1 >= max_retries:
                     return self._error_result(tool_name, filled_args, is_critical,
-                                              f"工具调用超时 ({self.step_timeout}s)")
+                                              f"工具调用超时 ({self.step_timeout}s)",
+                                              retry_count=attempt + inner_retries)
 
             except SkillExecutionError as e:
+                inner_retries += _inner(call_meta)
                 self._log("step_error", f"步骤 {index}: {tool_name} 失败 - {e}")
                 if attempt + 1 >= max_retries:
-                    return self._error_result(tool_name, filled_args, is_critical, str(e))
+                    return self._error_result(tool_name, filled_args, is_critical, str(e),
+                                              retry_count=attempt + inner_retries)
 
             except Exception as e:
+                inner_retries += _inner(call_meta)
                 self._log("step_error", f"步骤 {index}: {tool_name} 异常 - {e}")
                 if not is_retryable or attempt + 1 >= max_retries:
                     return self._error_result(tool_name, filled_args, is_critical,
-                                              f"{type(e).__name__}: {e}")
+                                              f"{type(e).__name__}: {e}",
+                                              retry_count=attempt + inner_retries)
 
         # 不应到达这里
         return self._error_result(tool_name, filled_args, is_critical, "未知错误")
@@ -412,8 +426,9 @@ class SkillExecutor:
         missing = [p for p in required if p not in (self.permissions or [])]
         return missing[0] if missing else None
 
-    def _error_result(self, tool: str, args: dict, critical: bool, msg: str) -> dict:
-        self._audit(tool, args, "", False, 0.0, 0, error=msg)
+    def _error_result(self, tool: str, args: dict, critical: bool, msg: str,
+                      retry_count: int = 0) -> dict:
+        self._audit(tool, args, "", False, 0.0, retry_count, error=msg)
         return {
             "tool_name": tool,
             "arguments": args,

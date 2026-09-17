@@ -161,9 +161,11 @@ class Scheduler:
 
         # 2. MCP 调用（call_tool 内部已含 asyncio.wait_for 超时 + tenacity 退避重试，
         #    故此处不再套外层 wait_for，避免掐断重试）
+        # call_meta 承接 call_tool 内部的真实尝试次数（含退避重试），供审计记录
+        call_meta = {}
         try:
             result = await self.mcp_client.call_tool(
-                decision.tool_name, decision.arguments
+                decision.tool_name, decision.arguments, meta=call_meta
             )
 
             # 3. 提取文本内容
@@ -176,7 +178,8 @@ class Scheduler:
                 f"({'失败' if is_error else '成功'}, {latency:.0f}ms)"
             )
             self._audit(decision, text, not is_error, latency,
-                        error=(text[:200] if is_error else ""))
+                        error=(text[:200] if is_error else ""),
+                        retry_count=max(0, call_meta.get("attempts", 1) - 1))
 
             return {
                 "tool_name": decision.tool_name,
@@ -190,7 +193,8 @@ class Scheduler:
             latency = (time.time() - start) * 1000
             logger.warning(f"工具 {decision.tool_name} 调用超时")
             self._audit(decision, "", False, latency,
-                        error=f"工具调用超时(重试后仍失败)")
+                        error=f"工具调用超时(重试后仍失败)",
+                        retry_count=max(0, call_meta.get("attempts", 1) - 1))
             return {
                 "tool_name": decision.tool_name,
                 "arguments": decision.arguments,
@@ -203,7 +207,8 @@ class Scheduler:
             latency = (time.time() - start) * 1000
             logger.error(f"工具 {decision.tool_name} 执行异常: {e}")
             self._audit(decision, "", False, latency,
-                        error=f"{type(e).__name__}: {e}")
+                        error=f"{type(e).__name__}: {e}",
+                        retry_count=max(0, call_meta.get("attempts", 1) - 1))
             return {
                 "tool_name": decision.tool_name,
                 "arguments": decision.arguments,
@@ -252,7 +257,7 @@ class Scheduler:
 
     # ── 审计 ──────────────────────────────────────────────────
 
-    def _audit(self, decision, result_preview, success, latency_ms, error=""):
+    def _audit(self, decision, result_preview, success, latency_ms, error="", retry_count=0):
         """写一条工具调用审计（失败静默，不阻断）+ LangFuse span。"""
         try:
             from tool_audit import log_tool_call
@@ -263,6 +268,7 @@ class Scheduler:
                 result_preview=result_preview,
                 latency_ms=latency_ms,
                 success=success,
+                retry_count=retry_count,
                 error=error,
                 user_id=self.user_id,
             )

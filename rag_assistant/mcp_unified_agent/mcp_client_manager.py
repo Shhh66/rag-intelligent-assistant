@@ -87,22 +87,19 @@ class MCPSession:
         logger.info(f"获取到 {len(self._tools_cache)} 个工具: {names}")
         return self._tools_cache
 
-    async def call_tool(self, name: str, arguments: dict):
+    async def call_tool(self, name: str, arguments: dict, meta: dict = None):
         """调用 MCP 工具（带熔断 + 超时 + 统一指数退避重试）。
 
         熔断器（职责 = MCP 通道可用性）：连续失败达阈值 → 打开熔断，冷却期内直接拒绝，
         防雪崩。它保护的是「MCP 子进程通道」（超时/崩溃），不是下游业务——
         DeepSeek 故障由子进程内 per-destination 熔断器负责（见 circuit_breaker.py）。
         重试：只重试瞬时故障（超时/连接错误）；工具业务错误(isError)由上层判断，不在此重试。
+
+        meta：可选的可变容器，调用结束时写入 `attempts`（实际发起的调用次数，含重试）。
+        供调用方记录重试次数——并行调度下每次调用传各自的容器，互不串台。
         """
         enabled, max_attempts, backoff_base, max_wait = _retry_config()
         breaker = _get_breaker_or_none()
-
-        # 熔断检查：OPEN 且未冷却 → 直接拒绝，不调用下游
-        if breaker is not None and not breaker.allow_request():
-            raise CircuitBreakerError(
-                f"熔断打开，工具 {name} 调用被拒绝（MCP 通道持续故障，冷却中）"
-            )
 
         # 瞬时故障类型（重试 + 熔断都针对它们）
         transient = (ToolCallTimeoutError, ConnectionError, TimeoutError, OSError)
@@ -118,8 +115,16 @@ class MCPSession:
             except asyncio.TimeoutError:
                 raise ToolCallTimeoutError(f"工具 {name} 超时 ({self.call_timeout}s)")
 
+        attempts = 0  # 实际发起的调用次数（含重试），经 meta 回传给调用方记录
         try:
+            # 熔断检查：OPEN 且未冷却 → 直接拒绝，不调用下游。
+            # 放在 try 内，使「未发起任何调用」也能经 finally 回传 attempts=0。
+            if breaker is not None and not breaker.allow_request():
+                raise CircuitBreakerError(
+                    f"熔断打开，工具 {name} 调用被拒绝（MCP 通道持续故障，冷却中）"
+                )
             if not enabled or max_attempts <= 1:
+                attempts = 1
                 result = await _once()
             else:
                 # 只对瞬时错误重试：超时、连接类异常
@@ -136,6 +141,7 @@ class MCPSession:
                     ):
                         with attempt:
                             n = attempt.retry_state.attempt_number
+                            attempts = n
                             if n > 1:
                                 logger.warning(f"工具 {name} 第 {n}/{max_attempts} 次重试")
                             result = await _once()
@@ -147,6 +153,10 @@ class MCPSession:
                 breaker.record_failure()
                 logger.warning(f"熔断器记录失败: {name} (state={breaker.status()})")
             raise
+        finally:
+            # 成功 / 重试耗尽 / 其它异常都经过这里，保证 meta 一定被写入
+            if meta is not None:
+                meta["attempts"] = attempts
 
         # 成功 → 熔断器复位（下游恢复正常）
         if breaker is not None:

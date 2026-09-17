@@ -44,7 +44,10 @@ COPY requirements.txt .
 # PyPI 源可覆盖：国内构建建议传 --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 # 不传时走默认官方源，行为与改造前一致
 ARG PIP_INDEX_URL=https://pypi.org/simple
-RUN pip install --no-cache-dir --index-url "$PIP_INDEX_URL" -r requirements.txt
+# 用 BuildKit cache mount 而非 --no-cache-dir：pip 下载缓存跨构建保留，
+# 大包（torch 554MB）断流重试时不必从头再下。依赖 BuildKit（Docker Desktop 默认启用）。
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --index-url "$PIP_INDEX_URL" -r requirements.txt
 
 # 复制项目代码（.dockerignore 已排除 venv/chroma_db/缓存等大文件）
 COPY . .

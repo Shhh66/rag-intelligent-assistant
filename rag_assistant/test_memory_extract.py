@@ -196,7 +196,7 @@ def test_routing():
         # 未达阈值 → 走原路径
         a = UnifiedAgent.__new__(UnifiedAgent)
         a._history, a._session_summary, a._llm_client = [], "", None
-        a.model, a._user_id, a._reflection = "t", "alice", None
+        a.model, a._user_id = "t", "alice"
         a._record_conversation("q1", "a1")
         check(len(rec.raw_calls) == 1 and not rec.summary_calls,
               "未触发压缩 → 走 extract_and_store（原行为）")

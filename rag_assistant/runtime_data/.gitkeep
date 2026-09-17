@@ -1,0 +1,21 @@
+# 运行产物目录（Docker 挂载到 /app/runtime_data）
+#
+# 目的：让容器内生成的运行产物持久化到宿主机，避免 `docker compose down` 后丢失。
+#
+# 包含：
+#   permission.db          权限数据库（api-server 写：用户/角色/分组）
+#   memory.db              长期记忆库（main 写）
+#   tool_audit.jsonl       工具调用审计（agent_eval.py 评测数据源）
+#   token_log.jsonl        Token 用量与成本历史
+#   qa_log.jsonl           问答日志
+#   alert.log              熔断告警记录
+#   bm25_index.pkl         BM25 索引（丢了会自动重建）
+#   formula_cache.json     公式识别缓存
+#
+# 该目录由 docker-compose.yml 挂载（api-server 与 main 各挂一次，文件互不重叠）。
+# 本地（非 Docker）运行时不会用到——RUNTIME_DATA_DIR 未设置时各文件仍在
+# rag_assistant/ 目录下，行为与改造前完全一致。
+#
+# ⚠️ 从旧版本升级到 Docker 部署时，请把已有数据移入本目录：
+#     move permission.db runtime_data\
+#     move memory.db     runtime_data\

@@ -83,7 +83,6 @@ def _new_agent():
     a._session_summary = ""
     a._llm_client = None
     a.model = "test-model"
-    a._reflection = None
     return a
 
 

@@ -1,8 +1,26 @@
 {
-  "mcpServers": {
-    "ai-assistant": {
-      "command": "d:/VsCode/AI/rag_assistant/venv/Scripts/python.exe",
-      "args": ["d:/VsCode/AI/rag_assistant/mcp_server.py"]
-    }
-  }
+    "mcpServers":  {
+                       "ai-assistant":  {
+                                            "command":  "d:/VsCode/AI/rag_assistant/venv/Scripts/python.exe",
+                                            "args":  [
+                                                         "d:/VsCode/AI/rag_assistant/mcp_server.py"
+                                                     ]
+                                        },
+                       "langchain-docs":  {
+                                              "args":  [
+                                                           "-y",
+                                                           "@anthropic-ai/mcp-server-langchain",
+                                                           "--docs"
+                                                       ],
+                                              "command":  "npx"
+                                          },
+                       "langchain-reference":  {
+                                                   "args":  [
+                                                                "-y",
+                                                                "@anthropic-ai/mcp-server-langchain",
+                                                                "--reference"
+                                                            ],
+                                                   "command":  "npx"
+                                               }
+                   }
 }

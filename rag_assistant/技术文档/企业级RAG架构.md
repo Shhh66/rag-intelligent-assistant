@@ -35,7 +35,7 @@
 
 | 进程 | 生命周期 | 常驻状态 | 为什么不放状态 |
 |------|---------|---------|--------------|
-| **主进程**（app.py + UnifiedAgent） | 常驻（`st.session_state.agent`） | 熔断器、限流器、对话历史、反思记忆、长期记忆 | ✅ 状态天然跨请求累积 |
+| **主进程**（app.py + UnifiedAgent） | 常驻（`st.session_state.agent`） | 熔断器、限流器、对话历史、会话摘要、长期记忆 | ✅ 状态天然跨请求累积 |
 | **MCP 子进程**（mcp_server.py） | **per-request**（每次 chat 新建 stdio） | 无 | 每次归零，放熔断/限流会形同虚设 |
 | **模型服务**（embed/rerank_server） | 常驻 HTTP | 模型权重（420MB/568MB） | 多实例共享一份模型 |
 | **权限后端**（api_server） | 常驻 HTTP | JWT、SQLite、用户级限流 | 独立鉴权，不信任入参 |

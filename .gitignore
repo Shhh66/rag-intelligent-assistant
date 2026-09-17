@@ -27,6 +27,7 @@ uploaded_docs/
 *.docx
 *.pdf
 项目简介.md
+简历解析/
 
 # 密钥文件
 .env
@@ -40,6 +41,21 @@ kb_permission_context.json
 agent_eval_report.md
 .cache/
 reports/
+
+# npm 缓存
+.npm-cache/
+
+# 测试临时目录（Chroma 临时实例）
+test_chroma_tmp/
+
+# 日志备份
+*.jsonl.bak
+
+# Docker 运行产物目录（只保留 .gitkeep，内容不提交）
+# 用 **/ 覆盖任意层级：原 'runtime_data/*' 只匹配仓库根，而实际目录在 rag_assistant/ 下，规则形同失效
+**/runtime_data/*
+!**/runtime_data/.gitkeep
+alert.log
 
 # 误创建文件
 =1.25

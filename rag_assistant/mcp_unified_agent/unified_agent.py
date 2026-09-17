@@ -94,6 +94,9 @@ class UnifiedAgent:
         self._session_summary: str = ""      # 会话摘要（压缩早期对话，注入 system）
         self._skill_registry: SkillRegistry | None = None  # Skill 注册表
         self._user_id: str = "default"       # 当前用户身份（长期记忆隔离，请求级，不再读文件）
+        # 会话标识：供 LangFuse 把多轮对话归入同一 session（清空记忆时换新）
+        import uuid as _uuid
+        self._session_id: str = _uuid.uuid4().hex
 
         # 工具向量索引（懒加载，首次 chat() 时构建并缓存）
         self._tool_filter: ToolVectorFilter | None = None
@@ -189,6 +192,14 @@ class UnifiedAgent:
         trace_id = uuid.uuid4().hex
         get_tracker().set_trace_id(trace_id)
 
+        # 设置观测上下文（trace 名 / 用户 / 会话），供 LangFuse 按用户与会话检索归因
+        try:
+            from observability import set_obs_context
+            set_obs_context(trace_id=trace_id, user_id=self._user_id,
+                            session_id=self._session_id)
+        except Exception:
+            pass
+
         # 把 trace_id 经环境变量带进 MCP 子进程，使子进程内检索链路的 span
         # 也能并入同一条 trace（子进程 per-request 新建，拿不到主进程状态）。
         # 取不到默认环境就不注入（env=None），行为与改造前完全一致。
@@ -199,7 +210,12 @@ class UnifiedAgent:
             #    不会被子进程继承，子进程会回落到 config 的 localhost 默认值
             #    （表现为子进程内 Redis 连不上、LangFuse 上报失败）。
             #    本地开发看不出来，因为本地默认值恰好就是 localhost。
-            child_env = {**get_default_environment(), **os.environ, "MCP_TRACE_ID": trace_id}
+            child_env = {
+                **get_default_environment(), **os.environ,
+                "MCP_TRACE_ID": trace_id,
+                "MCP_USER_ID": self._user_id,
+                "MCP_SESSION_ID": self._session_id,
+            }
         except Exception:
             child_env = None
         params = StdioServerParameters(
@@ -869,8 +885,10 @@ class UnifiedAgent:
 
     def clear_memory(self) -> None:
         """清空对话记忆（会话历史 + 会话摘要）。"""
+        import uuid
         self._history.clear()
         self._session_summary = ""   # 会话摘要随对话历史一起清空
+        self._session_id = uuid.uuid4().hex   # 换新会话标识：LangFuse 里两段对话分为两个 session
         logger.info("对话记忆已清空")
 
     @property

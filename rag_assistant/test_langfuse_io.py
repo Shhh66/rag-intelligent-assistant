@@ -162,5 +162,75 @@ _check("input" not in recorded and "output" not in recorded and "reasoning" not 
 _check(recorded.get("model") == "deepseek-flash" and "latency_ms" in recorded,
        "[开关关] 用量记录本身不受影响（model/latency 照常）")
 
+# ══════════════════════════════════════════════
+# 6. P1：trace 顶层入参/出参 + 工具 span 的 output
+# ══════════════════════════════════════════════
+class _FakeSpan:
+    def end(self):
+        pass
+
+
+class _FakeTrace:
+    def __init__(self, sink):
+        self._sink = sink
+
+    def update(self, **kw):
+        self._sink["updates"].append(kw)
+        return self
+
+    def span(self, **kw):
+        self._sink["spans"].append(kw)
+        return _FakeSpan()
+
+
+class _FakeLFClient:
+    def __init__(self):
+        self.sink = {"updates": [], "spans": []}
+
+    def trace(self, **kw):
+        return _FakeTrace(self.sink)
+
+
+_orig_client = observability._get_client
+_orig_flag = config.LANGFUSE_CAPTURE_IO
+
+fake = _FakeLFClient()
+observability._get_client = lambda: fake
+try:
+    observability.update_trace_io("a" * 32, input="明天周五，我有课吗", output="x" * 2500)
+    observability.update_trace_io("b" * 32, input="", output=None)
+    with observability.obs_span("工具:demo", trace_id="a" * 32,
+                                input={"city": "北京"},
+                                output=observability.truncate_io("y" * 800)):
+        pass
+finally:
+    observability._get_client = _orig_client
+
+updates = fake.sink["updates"]
+_check(updates[0]["input"] == "明天周五，我有课吗", "trace 顶层写入 input=用户问题")
+_check(updates[0]["output"].startswith("x" * 100) and "(+" in updates[0]["output"],
+       "trace 顶层 output 超长被截断并标注")
+_check(len(updates[0]["output"]) < 2100, "截断后长度受控（2500 字未全量上报）")
+_check(updates[1]["input"] is None and updates[1]["output"] is None,
+       "空入参/出参写 None，不产生空串噪音")
+
+spans = fake.sink["spans"]
+_check(spans[0]["input"] == {"city": "北京"} and spans[0]["output"].endswith(")"),
+       "工具 span 同时带上入参与出参，output 已截断")
+
+_check(observability.truncate_io("短文本") == "短文本", "truncate_io 短文本原样返回")
+_check(observability.truncate_io(None) is None and observability.truncate_io("") is None,
+       "truncate_io 空值返回 None")
+
+fake2 = _FakeLFClient()
+observability._get_client = lambda: fake2
+try:
+    config.LANGFUSE_CAPTURE_IO = False
+    observability.update_trace_io("c" * 32, input="q", output="a")
+finally:
+    observability._get_client = _orig_client
+    config.LANGFUSE_CAPTURE_IO = _orig_flag
+_check(not fake2.sink["updates"], "[开关关] trace 顶层入参/出参同样不写")
+
 print("\n".join(f"✅ {p}" for p in PASS))
 print(f"\n🎉 全部通过（{len(PASS)} 项断言，零 API 成本）")

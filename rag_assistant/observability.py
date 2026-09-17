@@ -98,8 +98,12 @@ def _get_trace(client, trace_id):
 
 
 @contextmanager
-def obs_span(name, trace_id="", metadata=None, level="DEFAULT", input=None):
-    """一个 span 上下文管理器；LangFuse 不可用时是纯 no-op。"""
+def obs_span(name, trace_id="", metadata=None, level="DEFAULT", input=None, output=None):
+    """一个 span 上下文管理器；LangFuse 不可用时是纯 no-op。
+
+    input/output 均为创建时写入（调用方需在进入前就拿到结果，如工具调用的
+    result_preview），不是退出时回填。
+    """
     client = _get_client()
     if client is None:
         yield None
@@ -111,6 +115,7 @@ def obs_span(name, trace_id="", metadata=None, level="DEFAULT", input=None):
             metadata=metadata or {},
             level=level,
             input=input,
+            output=output,
         )
     except Exception as e:
         logger.debug(f"obs_span 创建失败(忽略): {e}")
@@ -178,12 +183,33 @@ def _truncate(text, limit: int) -> str:
     return text[:limit] + f"...(+{len(text) - limit})"
 
 
-def _io_maxlen() -> int:
+def _cfg_maxlen(cfg_name: str, default: int) -> int:
+    """读配置里的截断上限；缺该项配置时用默认值（不阻断上报）。"""
     try:
-        from config import LANGFUSE_IO_MAXLEN
-        return LANGFUSE_IO_MAXLEN
+        import config
+        return getattr(config, cfg_name, default)
     except Exception:
-        return 500
+        return default
+
+
+def _io_maxlen() -> int:
+    return _cfg_maxlen("LANGFUSE_IO_MAXLEN", 500)
+
+
+def _capture_enabled() -> bool:
+    """入参/出参上报总开关；配置不可读时保守视为关闭（隐私优先）。"""
+    try:
+        from config import LANGFUSE_CAPTURE_IO
+        return bool(LANGFUSE_CAPTURE_IO)
+    except Exception:
+        return False
+
+
+def truncate_io(text, limit: int = None):
+    """按上报上限截断一段文本；空值返回 None（供 span 的 output 等复用）。"""
+    if not text:
+        return None
+    return _truncate(text, limit if limit is not None else _io_maxlen())
 
 
 def summarize_messages(messages):
@@ -221,6 +247,30 @@ def extract_output(resp):
         return content, (_truncate(reasoning, _io_maxlen()) if reasoning else None)
     except Exception:
         return None, None
+
+
+def update_trace_io(trace_id="", input=None, output=None):
+    """给 trace 补顶层入参/出参（一次 chat 结束时调用一次）。
+
+    集中在末尾写、而非在开头随 trace 创建时写：_get_trace 在每个
+    span/generation 创建时都会按 id 引用一次 trace，中途写入的 input/output
+    可能被后续 upsert 覆盖回空。放在最后写一次，时序上不存在更晚的写入来冲掉它。
+
+    受 LANGFUSE_CAPTURE_IO 总开关控制（关闭时与 generation 一起停报）。
+    """
+    if not _capture_enabled():
+        return
+    client = _get_client()
+    if client is None:
+        return
+    limit = _cfg_maxlen("LANGFUSE_TRACE_IO_MAXLEN", 2000)
+    try:
+        _get_trace(client, trace_id).update(
+            input=_truncate(input, limit) if input else None,
+            output=_truncate(output, limit) if output else None,
+        )
+    except Exception as e:
+        logger.debug(f"update_trace_io 失败(忽略): {e}")
 
 
 def flush_obs():

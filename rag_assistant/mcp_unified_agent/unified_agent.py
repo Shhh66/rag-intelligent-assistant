@@ -278,6 +278,13 @@ class UnifiedAgent:
                     f"(in={summary['total_input']:,}, out={summary['total_output']:,}) | "
                     f"费用: ¥{summary['total_cost']:.6f}"
                 )
+                # 给 trace 补顶层入参/出参，让 LangFuse 列表页一眼可见「问了什么/答了什么」。
+                # 必须在 flush 之前 —— 否则这次 update 不在本批上报里。
+                try:
+                    from observability import update_trace_io
+                    update_trace_io(trace_id, input=user_input, output=answer)
+                except Exception:
+                    pass
                 # flush LangFuse 上报（降级安全）
                 try:
                     from observability import flush_obs

@@ -294,6 +294,7 @@ LANGFUSE_HOST = os.getenv("LANGFUSE_HOST", "http://localhost:3000")
 # 关掉时代码不会去读 messages，连截断副本都不产生。
 LANGFUSE_CAPTURE_IO = True
 LANGFUSE_IO_MAXLEN = 500                  # 单条 message / 输出的截断长度（仅 CAPTURE_IO=True 生效）
+LANGFUSE_TRACE_IO_MAXLEN = 2000           # trace 顶层入参/出参的截断长度（每 trace 仅一份，可比 generation 宽松）
 
 # ===== 长期记忆（跨会话实体记忆与检索）=====
 LONG_TERM_MEMORY_ENABLED = True           # 长期记忆总开关

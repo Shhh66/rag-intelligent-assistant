@@ -270,7 +270,7 @@ class Scheduler:
             pass
         # LangFuse span（降级安全）
         try:
-            from observability import obs_span
+            from observability import obs_span, truncate_io
             with obs_span(
                 f"工具:{decision.tool_name}",
                 trace_id=self.trace_id,
@@ -278,6 +278,7 @@ class Scheduler:
                           "error": error[:120] if error else ""},
                 level="ERROR" if not success else "DEFAULT",
                 input=decision.arguments,
+                output=truncate_io(result_preview),
             ):
                 pass
         except Exception:

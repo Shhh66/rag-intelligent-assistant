@@ -290,6 +290,10 @@ LANGFUSE_ENABLED = True                   # 总开关（默认关，需先起 La
 LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY", "")
 LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY", "")
 LANGFUSE_HOST = os.getenv("LANGFUSE_HOST", "http://localhost:3000")
+# generation 的输入/输出上报。False = 完全不上报（字段留空），而非「取消截断」——
+# 关掉时代码不会去读 messages，连截断副本都不产生。
+LANGFUSE_CAPTURE_IO = True
+LANGFUSE_IO_MAXLEN = 500                  # 单条 message / 输出的截断长度（仅 CAPTURE_IO=True 生效）
 
 # ===== 长期记忆（跨会话实体记忆与检索）=====
 LONG_TERM_MEMORY_ENABLED = True           # 长期记忆总开关

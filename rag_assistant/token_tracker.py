@@ -150,6 +150,9 @@ class TokenTracker:
         usage,
         call_site: str = "",
         latency_ms: float = None,
+        input=None,
+        output=None,
+        reasoning: str = None,
     ) -> TokenUsage:
         """记录一次 LLM 调用。
 
@@ -158,6 +161,10 @@ class TokenTracker:
             usage: OpenAI SDK 返回的 response.usage
             call_site: 调用位置标识
             latency_ms: 本次 LLM 调用耗时（毫秒），仅用于 LangFuse generation 的耗时展示
+            input: 已脱敏截断的入参摘要（由 observability.summarize_messages 产出），
+                   为 None 时 LangFuse 上该字段留空
+            output: 已脱敏截断的出参，为 None 时留空
+            reasoning: 推理模型的思维链（已截断），仅写入 metadata，不占 output 字段
 
         Returns:
             TokenUsage: 本次调用的用量记录
@@ -200,12 +207,17 @@ class TokenTracker:
         # 上报 LangFuse generation（降级安全，复用当前 trace_id）
         try:
             from observability import obs_generation
+            gmeta = {"call_site": call_site, "cost_rmb": cost}
+            if reasoning:
+                gmeta["reasoning_content"] = reasoning
             obs_generation(
                 trace_id=getattr(self, "_current_trace_id", ""),
                 name=call_site or "llm",
                 model=model,
                 usage=usage,
-                metadata={"call_site": call_site, "cost_rmb": cost},
+                input=input,
+                output=output,
+                metadata=gmeta,
                 latency_ms=latency_ms,
             )
         except Exception:

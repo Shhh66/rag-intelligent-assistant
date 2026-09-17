@@ -44,3 +44,11 @@ torch>=2.2             # 重排推理（CPU 版即可）
 
 # ===== 检索缓存（部署运维改造 P2）=====
 redis>=5.0             # 检索结果缓存（Redis 分布式缓存，search_cache.py）
+
+# ===== 教务系统接入（tools_edu.py，CAS 登录 + 课表查询）=====
+# 三个都是 tools_edu.py 的顶层 import，必须显式声明：
+# bs4/lxml 以往靠上游包传递安装（碰巧有），一旦传递链变化工具即崩；
+# pycryptodome 提供 Crypto 命名空间（注意不是 pycryptodomex，那个是 Cryptodome）——AES 加密 CAS 密码用
+pycryptodome>=3.20
+beautifulsoup4>=4.12
+lxml>=5.0

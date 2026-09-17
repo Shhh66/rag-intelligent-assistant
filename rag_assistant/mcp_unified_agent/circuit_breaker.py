@@ -174,10 +174,22 @@ def call_llm_with_cb(client, model, messages, temperature, max_tokens, call_site
             breaker.record_failure()
         raise
     breaker.record_success()
+    # 入参/出参采集（供 LangFuse 回溯）。总开关关闭时不去读 messages——
+    # 连截断副本都不产生，而非「采集了但不上报」。
+    _io = {}
+    try:
+        from config import LANGFUSE_CAPTURE_IO
+        if LANGFUSE_CAPTURE_IO:
+            from observability import summarize_messages, extract_output
+            _out, _reason = extract_output(resp)
+            _io = {"input": summarize_messages(messages),
+                   "output": _out, "reasoning": _reason}
+    except Exception:
+        pass  # 采集失败不影响用量记录本身
     try:
         from token_tracker import get_tracker
         get_tracker().record(model, resp.usage, call_site=call_site,
-                             latency_ms=(time.monotonic() - _t0) * 1000)
+                             latency_ms=(time.monotonic() - _t0) * 1000, **_io)
     except Exception:
         pass
     return resp

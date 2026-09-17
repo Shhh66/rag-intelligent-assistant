@@ -12,6 +12,7 @@
     obs_generation(trace_id=tid, name="rag_answer", model=..., usage=..., input=..., output=...)
 """
 
+import json
 import logging
 import os
 from contextlib import contextmanager
@@ -48,29 +49,52 @@ def _get_client():
     return _client
 
 
-def _env_trace_id() -> str:
-    """子进程兜底：主进程通过 MCP_TRACE_ID 环境变量把 trace_id 带进 MCP 子进程。
+# 当前请求的观测上下文。主进程由 set_obs_context() 显式设置；
+# MCP 子进程是 per-request 新建的、拿不到主进程状态，故回落到读环境变量。
+_ctx = {"trace_id": "", "user_id": "", "session_id": ""}
 
-    MCP 子进程是 per-request 新建的，检索链路（retriever）跑在子进程内，
-    它拿不到主进程的 trace_id —— 不兜底的话子进程 span 会各自变成独立 trace。
+
+def set_obs_context(trace_id="", user_id="", session_id=""):
+    """设置当前请求的观测上下文（由主进程 chat 入口调用）。"""
+    _ctx["trace_id"] = trace_id or ""
+    _ctx["user_id"] = user_id or ""
+    _ctx["session_id"] = session_id or ""
+
+
+def _ctx_value(key: str, env_name: str) -> str:
+    """取上下文值：主进程读 _ctx，子进程回落环境变量。
+
+    环境变量兜底的原因：检索链路（retriever 等）跑在 MCP 子进程内，
+    拿不到主进程的上下文 —— 不兜底则子进程的 span 会各自变成孤立 trace，
+    且丢失 user / session 归因。
     """
+    v = _ctx.get(key) or ""
+    if v:
+        return v
     try:
-        return os.getenv("MCP_TRACE_ID", "") or ""
+        return os.getenv(env_name, "") or ""
     except Exception:
         return ""
 
 
 def _get_trace(client, trace_id):
-    """按 trace_id 取/建 trace。
+    """按 trace_id 取/建 trace，并带上 name / user_id / session_id 便于检索归因。
 
     LangFuse v2 SDK 用 client.trace(id=...) 引用 trace，同 id 幂等（服务端 upsert），
     所以每个 span/generation 各自取一次是安全的，不会产生重复 trace。
     trace_id 为 32 位小写 hex（uuid4().hex），符合服务端要求。
     """
-    tid = trace_id or _env_trace_id()
+    kwargs = {"name": "chat"}
+    tid = trace_id or _ctx_value("trace_id", "MCP_TRACE_ID")
     if tid:
-        return client.trace(id=tid)
-    return client.trace()
+        kwargs["id"] = tid
+    uid = _ctx_value("user_id", "MCP_USER_ID")
+    if uid:
+        kwargs["user_id"] = uid
+    sid = _ctx_value("session_id", "MCP_SESSION_ID")
+    if sid:
+        kwargs["session_id"] = sid
+    return client.trace(**kwargs)
 
 
 @contextmanager
@@ -140,6 +164,63 @@ def obs_generation(trace_id="", name="llm", model=None, usage=None,
         gen.end()
     except Exception as e:
         logger.debug(f"obs_generation 失败(忽略): {e}")
+
+
+# ── 入参/出参的脱敏截断（上报前的最后一道关）──
+# messages 里含基座模板、历史摘要、长期记忆注入、检索结果，全量上传既不安全也撑爆存储，
+# 故逐条截断：只保留「模型收到了什么角色、开头说了什么」这一层信息。
+
+def _truncate(text, limit: int) -> str:
+    """截断长文本并标注省略量，便于一眼看出被裁了多少。"""
+    text = "" if text is None else str(text)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"...(+{len(text) - limit})"
+
+
+def _io_maxlen() -> int:
+    try:
+        from config import LANGFUSE_IO_MAXLEN
+        return LANGFUSE_IO_MAXLEN
+    except Exception:
+        return 500
+
+
+def summarize_messages(messages):
+    """把 OpenAI messages 压成可上报摘要：逐条截断 + 保留 role。
+
+    system 消息（基座模板 + 【历史摘要】）与其他 role 同样按上限截断——
+    只露出开头的角色定义，历史摘要与记忆注入不会被全量带出。
+    """
+    if not messages:
+        return None
+    limit = _io_maxlen()
+    out = []
+    for m in messages:
+        if not isinstance(m, dict):
+            out.append({"role": "?", "content": _truncate(m, limit)})
+            continue
+        content = m.get("content", "")
+        if not isinstance(content, str):
+            content = json.dumps(content, ensure_ascii=False)
+        out.append({"role": m.get("role", "?"), "content": _truncate(content, limit)})
+    return out
+
+
+def extract_output(resp):
+    """从回包提取 (正文, 思考过程)，各自截断。
+
+    reasoning_content 是推理模型特有的思维链，单独返回供调用方塞进 metadata，
+    不占 output 字段——否则正文会被思考过程挤没。
+    返回 (None, None) 表示回包结构异常，调用方按「无输出」处理。
+    """
+    try:
+        msg = resp.choices[0].message
+        content = _truncate(getattr(msg, "content", "") or "", _io_maxlen())
+        reasoning = getattr(msg, "reasoning_content", None)
+        return content, (_truncate(reasoning, _io_maxlen()) if reasoning else None)
+    except Exception:
+        return None, None
 
 
 def flush_obs():
